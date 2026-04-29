@@ -12,10 +12,18 @@ import numpy as np
 def get_batch(split, block_size, batch_size, device, device_type):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+
+    # Check for combined dataset first, then fall back to original
     if split == 'train':
-        data = np.memmap('data/processed_datasets/train.bin', dtype=np.uint16, mode='r')
+        combined_path = 'data/processed_datasets/train_combined.bin'
+        original_path = 'data/processed_datasets/train.bin'
+        data_path = combined_path if os.path.isfile(combined_path) else original_path
     else:
-        data = np.memmap('data/processed_datasets/validation.bin', dtype=np.uint16, mode='r')
+        combined_path = 'data/processed_datasets/validation_combined.bin'
+        original_path = 'data/processed_datasets/validation.bin'
+        data_path = combined_path if os.path.isfile(combined_path) else original_path
+
+    data = np.memmap(data_path, dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])

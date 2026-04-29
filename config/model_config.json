@@ -1,5 +1,6 @@
 {
     "vocab_size": 50257,
+    "tokenizer": "gpt2",
     "context_length": 32768,
     "emb_dim": 640,
     "n_heads": 4,

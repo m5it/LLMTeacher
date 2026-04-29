@@ -30,7 +30,7 @@ from training import (
     batch_size, block_size, gradient_accumulation_steps, device,
     device_type, dtype, ctx, get_batch, estimate_loss
 )
-from data_processor import processor_gpt2_tokenizer, get_tokenizer, get_tokenizer_name, save_checkpoint_metadata, get_vocab_size
+from data_processor import processor_gpt2_tokenizer, get_tokenizer, get_tokenizer_name, save_checkpoint_metadata, get_vocab_size, log_tokenizer_usage
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 import wandb
 

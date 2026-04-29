@@ -66,6 +66,7 @@ Lists all available checkpoints in `data/models/`. Shows file size and tokenizer
 
 ### `history`
 Shows last N commands from `history.log`. Use `-n <int>` to change number of entries.
+Tokenizer usage is automatically logged when training starts.
 
 ## Configuration
 
@@ -86,10 +87,28 @@ Training hyperparameters:
 ## Tokenizer Setup
 
 The tokenizer is centralized in `config/model_config.json` with field `"tokenizer"`. Supported values:
-- `"gpt2"` - GPT-2 tokenizer (50,257 vocab size). Fast, small embedding layer.
-- `"gemma3"` - Gemma3 tokenizer (256k vocab). Requires `transformers` library and `google/gemma-3-270m` model.
 
-When you change tokenizer, re-run `prepare` and `prepare-rocstories` to re-tokenize datasets.
+| Tokenizer | Vocab Size | Model Used | Notes |
+|-----------|------------|------------|-------|
+| `"gpt2"` | 50,257 | GPT-2 | Fast, small embedding (~32M params) |
+| `"gemma3"` | ~256k | Gemma 2B (LlamaTokenizerFast) | Matches Gemma3 vocab exactly |
+| `"llama"` | 32,000 | Llama 2 7B | Requires HF auth `huggingface-cli login` |
+| `"bert"` | 110,842 | BERT Base Uncased | Bidirectional encoder tokenizer |
+| `"bert-cased"` | 110,842 | BERT Base Cased | Preserves case |
+| `"t5"` | 32,128 | T5 Small (SentencePiece) | Prefix: `<extra_id_XX>` |
+| `"t5-large"` | 32,128 | T5 Large (SentencePiece) | Larger model, same vocab |
+
+**Important:** When you change tokenizer, re-run:
+```bash
+python llmteacher.py prepare
+python llmteacher.py prepare-rocstories
+python llmteacher.py combine-datasets
+```
+
+### Tokenizer Comparison
+```bash
+python -c "from data_processor.tokenizer_loader import compare_tokenizers; print(compare_tokenizers('Hello, world!'))"
+```
 
 ## Checkpoint Management
 

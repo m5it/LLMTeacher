@@ -9,12 +9,12 @@ From-scratch PyTorch implementation of Gemma3 270M, pre-trained on TinyStories.
 - Training requires W&B login (`wandb login`) before running `02_pre_training.py`.
 
 ## Entrypoints
-- **Unified CLI**: `python run.py <command>` (preferred, replaces individual scripts)
-  - `python run.py prepare` - Download and tokenize TinyStories dataset
-  - `python run.py train [--checkpoint path]` - Train from scratch or continue from checkpoint
-  - `python run.py continue <checkpoint>` - Continue training from checkpoint
-  - `python run.py generate [--prompt text] [--checkpoint path]` - Generate text
-  - `python run.py list-checkpoints` - List available model checkpoints
+- **Unified CLI**: `python llmteacher.py <command>` (preferred, replaces individual scripts)
+  - `python llmteacher.py prepare` - Download and tokenize TinyStories dataset
+  - `python llmteacher.py train [--checkpoint path]` - Train from scratch or continue from checkpoint
+  - `python llmteacher.py continue <checkpoint>` - Continue training from checkpoint
+  - `python llmteacher.py generate [--prompt text] [--checkpoint path]` - Generate text
+  - `python llmteacher.py list-checkpoints` - List available model checkpoints
 - Legacy scripts (still functional):
   - `python 01_data_preparation.py` (downloads TinyStories, tokenizes to binary, requires `datasets` not in `requirements.txt`)
   - `python 02_pre_training.py` (W&B logging, requires `wandb` not in `requirements.txt`)

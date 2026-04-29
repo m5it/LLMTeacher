@@ -1,6 +1,6 @@
-# Gemma3 270M - TinyStories - PyTorch Implementation
+# LLMTeacher - Gemma3 270M TinyStories - PyTorch Implementation
 
-This project provides a from-scratch PyTorch implementation of Google DeepMind's Gemma3 270M model. It features a streamlined transformer architecture designed to help users understand and experiment with the core components of large language models.
+This project provides a from-scratch PyTorch implementation of Google DeepMind's Gemma3 270M model, named **LLMTeacher**. It features a streamlined transformer architecture designed to help users understand and experiment with the core components of large language models.
 
 **Objective:** This project aims to evaluate the coherence and language modeling capabilities of a small transformer-based model (Gemma3 270M) when trained from scratch on the TinyStories dataset. By leveraging TinyStories — a dataset of simple, coherent narratives—we can directly assess how well a compact language model learns to generate logical, contextually consistent, and fluent text. This setup provides valuable insights into the strengths and limitations of small-scale LLMs for story generation.
 

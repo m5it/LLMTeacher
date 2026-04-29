@@ -245,7 +245,47 @@ def train(checkpoint_path=None, output_path=None):
     torch.manual_seed(123)
     model = Gemma3Model(model_config)
 
+    # Check tokenizer consistency between checkpoint and current config
+    current_tokenizer = get_tokenizer_name()
     if checkpoint_path and os.path.exists(checkpoint_path):
+        # Try to load metadata to check tokenizer
+        meta_path = str(checkpoint_path).replace(".pt", "_meta.json")
+        if os.path.exists(meta_path):
+            try:
+                meta = json.loads(Path(meta_path).read_text())
+                checkpoint_tokenizer = meta.get("tokenizer", "unknown")
+                if checkpoint_tokenizer != current_tokenizer:
+                    print("\n" + "!" * 80)
+                    print(f"⚠️  WARNING: TOKENIZER MISMATCH!")
+                    print("!" * 80)
+                    print(f"  Checkpoint was trained with tokenizer: {checkpoint_tokenizer}")
+                    print(f"  Current config uses tokenizer:    {current_tokenizer}")
+                    print()
+                    print("  This will likely cause INCORRECT tokenization and BAD results!")
+                    print()
+                    print("  📝 Tips:")
+                    print(f"     1. To continue with {checkpoint_tokenizer}, edit config/model_config.json:")
+                    print(f'        "tokenizer": "{checkpoint_tokenizer}"')
+                    print(f"     2. To switch to {current_tokenizer}, re-prepare data:")
+                    print(f"        python llmteacher.py prepare")
+                    print(f"        python llmteacher.py prepare-rocstories")
+                    print(f"        python llmteacher.py combine-datasets")
+                    print(f"     3. Or start fresh with current tokenizer:")
+                    print(f"        python llmteacher.py train --output data/models/new_run.pt")
+                    print("!" * 80 + "\n")
+                    response = input("  Continue anyway? (yes/no): ")
+                    if response.lower() != "yes":
+                        print("Aborting. Please fix tokenizer mismatch first.")
+                        exit(1)
+                else:
+                    print(f"✅ Tokenizer match: {current_tokenizer}")
+            except Exception as e:
+                print(f"Warning: Could not read metadata: {e}")
+        else:
+            print(f"\n⚠️  Warning: No metadata found for {checkpoint_path}")
+            print(f"   Cannot verify tokenizer consistency. Current: {current_tokenizer}")
+            print(f"   If checkpoint was trained with a different tokenizer, results will be wrong!\n")
+
         print(f"Loading checkpoint: {checkpoint_path}")
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     elif checkpoint_path:
@@ -388,6 +428,28 @@ def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100,
     print(f"  Device: {device}")
     print(f"{'='*60}\n")
 
+    # Check tokenizer consistency for generation
+    current_tokenizer = get_tokenizer_name()
+    meta_path = str(checkpoint_path).replace(".pt", "_meta.json")
+    if os.path.exists(meta_path):
+        try:
+            meta = json.loads(Path(meta_path).read_text())
+            checkpoint_tokenizer = meta.get("tokenizer", "unknown")
+            if checkpoint_tokenizer != current_tokenizer:
+                print("\n" + "!" * 80)
+                print("⚠️  WARNING: TOKENIZER MISMATCH!")
+                print("!" * 80)
+                print(f"  Checkpoint was trained with tokenizer: {checkpoint_tokenizer}")
+                print(f"  Current config uses tokenizer:      {current_tokenizer}")
+                print("\n  This will generate INCORRECT text!")
+                print("\n  💡 Tips:")
+                print(f"     1. To use this checkpoint, edit config/model_config.json:")
+                print(f'        "tokenizer": "{checkpoint_tokenizer}"')
+                print(f"     2. Or load a checkpoint that matches your current tokenizer")
+                print("!" * 80 + "\n")
+        except:
+            pass
+
     model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
     model = model.to(device)
     model.eval()
@@ -482,6 +544,13 @@ def main():
     # Combine datasets
     subparsers.add_parser("combine-datasets", help="Combine TinyStories + ROCStories into single files")
 
+    # Prepare CodeSearchNet
+    codesearch_parser = subparsers.add_parser("prepare-codesearch", help="Download and process CodeSearchNet dataset")
+    codesearch_parser.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer to use")
+
+    # Combine with CodeSearchNet
+    subparsers.add_parser("combine-with-code", help="Combine existing data with CodeSearchNet")
+
     # Train
     train_parser = subparsers.add_parser("train", help="Train model from scratch")
     train_parser.add_argument("--checkpoint", type=str, help="Continue training from checkpoint")
@@ -504,6 +573,14 @@ def main():
     # List checkpoints
     subparsers.add_parser("list-checkpoints", help="List available model checkpoints")
 
+    # Chat
+    chat_parser = subparsers.add_parser("chat", help="Start interactive chat with LLMTeacher")
+    chat_parser.add_argument("--checkpoint", type=str, help="Model checkpoint to use")
+    chat_parser.add_argument("--latest", action="store_true", help="Use the most recent checkpoint")
+    chat_parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
+    chat_parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling parameter")
+    chat_parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens per response")
+
     # History
     history_parser = subparsers.add_parser("history", help="Show command history")
     history_parser.add_argument("-n", type=int, default=10, help="Number of recent commands to show")
@@ -524,6 +601,12 @@ def main():
         prepare_rocstories()
     elif args.command == "combine-datasets":
         combine_datasets()
+    elif args.command == "prepare-codesearch":
+        from data_processor.codesearchnet import process_codesearchnet
+        process_codesearchnet(tokenizer_name=args.tokenizer)
+    elif args.command == "combine-with-code":
+        from data_processor.codesearchnet import combine_with_codesearchnet
+        combine_with_codesearchnet()
     elif args.command == "train":
         train(args.checkpoint, args.output)
     elif args.command == "continue":
@@ -532,8 +615,145 @@ def main():
         generate(args.prompt, args.checkpoint, args.latest, args.max_tokens, args.temperature, args.top_k)
     elif args.command == "list-checkpoints":
         list_checkpoints()
+    elif args.command == "chat":
+        chat(args.checkpoint, args.latest, args.temperature, args.top_k, args.max_tokens)
     elif args.command == "history":
         show_history(args.n)
+
+
+def chat(checkpoint_path=None, use_latest=False, temperature=0.8, top_k=50, max_tokens=100):
+    """Start interactive chat with LLMTeacher."""
+    if use_latest:
+        checkpoint_path = get_latest_checkpoint()
+        if checkpoint_path:
+            print(f"Using latest checkpoint: {checkpoint_path}")
+        else:
+            print("No checkpoints found.")
+            return
+    elif not checkpoint_path:
+        checkpoint_path = "data/models/best_model_params.pt"
+
+    if not os.path.exists(checkpoint_path):
+        print(f"No checkpoint found at {checkpoint_path}. Please train first.")
+        available = list_checkpoints_str()
+        if available:
+            print(f"Available checkpoints:\n{available}")
+        return
+
+    # Check tokenizer consistency
+    current_tokenizer = get_tokenizer_name()
+    meta_path = str(checkpoint_path).replace(".pt", "_meta.json")
+    if os.path.exists(meta_path):
+        try:
+            meta = json.loads(Path(meta_path).read_text())
+            checkpoint_tokenizer = meta.get("tokenizer", "unknown")
+            if checkpoint_tokenizer != current_tokenizer:
+                print("\n" + "!" * 80)
+                print("⚠️  WARNING: TOKENIZER MISMATCH!")
+                print("!" * 80)
+                print(f"  Checkpoint was trained with tokenizer: {checkpoint_tokenizer}")
+                print(f"  Current config uses tokenizer:    {current_tokenizer}")
+                print("\n  This will generate INCORRECT text!")
+                print("\n  💡 Tips:")
+                print(f"     1. To use this checkpoint, edit config/model_config.json:")
+                print(f'        "tokenizer": "{checkpoint_tokenizer}"')
+                print(f"     2. Or load a checkpoint that matches your current tokenizer")
+                print("!" * 80 + "\n")
+        except:
+            pass
+
+    # Load model
+    model_config["dtype"] = torch.bfloat16
+    torch.manual_seed(123)
+    model = Gemma3Model(model_config)
+    print(f"\nLoading checkpoint: {checkpoint_path}")
+    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+    model = model.to(device)
+    model.eval()
+
+    # Load tokenizer
+    tokenizer_name = get_tokenizer_name()
+    if tokenizer_name == "gpt2":
+        import tiktoken
+        enc = tiktoken.get_encoding("gpt2")
+        decode_fn = lambda tokens: enc.decode(tokens)
+    elif tokenizer_name == "gemma3":
+        from transformers import AutoTokenizer
+        enc = AutoTokenizer.from_pretrained("google/gemma-3-270m")
+        decode_fn = lambda tokens: enc.decode(tokens, skip_special_tokens=True)
+    elif tokenizer_name in ["llama"]:
+        from transformers import AutoTokenizer
+        enc = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", trust_remote_code=True)
+        decode_fn = lambda tokens: enc.decode(tokens, skip_special_tokens=True)
+    elif tokenizer_name in ["bert", "bert-cased"]:
+        from transformers import AutoTokenizer
+        enc = AutoTokenizer.from_pretrained(f"bert-base-{tokenizer_name.replace('-', '')}", trust_remote_code=True)
+        decode_fn = lambda tokens: enc.decode(tokens, skip_special_tokens=True)
+    elif tokenizer_name in ["t5", "t5-large"]:
+        from transformers import AutoTokenizer
+        enc = AutoTokenizer.from_pretrained(f"{tokenizer_name}-small" if tokenizer_name == "t5" else "t5-large", trust_remote_code=True)
+        decode_fn = lambda tokens: enc.decode(tokens, skip_special_tokens=True)
+    else:
+        raise ValueError(f"Unsupported tokenizer: {tokenizer_name}")
+
+    print(f"\n{'='*60}")
+    print(f"LLMTeacher Chat - Tokenizer: {tokenizer_name}")
+    print(f"Type 'quit' or 'exit' to stop")
+    print(f"{'='*60}\n")
+
+    # Chat loop
+    history_tokens = []
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye!")
+            break
+
+        if user_input.lower() in ["quit", "exit", "q"]:
+            print("Goodbye!")
+            break
+
+        if not user_input:
+            continue
+
+        # Tokenize and add to history
+        if tokenizer_name == "gpt2":
+            new_tokens = enc.encode_ordinary(user_input)
+        else:
+            new_tokens = enc.encode(user_input, add_special_tokens=False)
+
+        history_tokens.extend(new_tokens)
+
+        # Trim to block_size
+        if len(history_tokens) > block_size:
+            history_tokens = history_tokens[-block_size:]
+
+        tokens = torch.tensor(history_tokens, dtype=torch.long, device=device).unsqueeze(0)
+
+        # Generate response
+        generated_tokens = []
+        with torch.no_grad():
+            for _ in range(max_tokens):
+                if tokens.size(1) > block_size:
+                    tokens = tokens[:, -block_size:]
+                logits, _ = model(tokens)
+                logits = logits[:, -1, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                tokens = torch.cat((tokens, next_token), dim=1)
+                generated_tokens.append(next_token.item())
+                if next_token.item() == (enc.eos_token_id if hasattr(enc, 'eos_token_id') else 0):
+                    break
+
+        response = decode_fn(generated_tokens)
+        print(f"LLM: {response}\n")
+
+        # Add response to history
+        history_tokens.extend(generated_tokens)
 
 
 if __name__ == "__main__":

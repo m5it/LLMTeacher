@@ -60,6 +60,23 @@ python llmteacher.py generate --prompt "A little girl" --latest --max-tokens 200
 ### `list-checkpoints`
 Lists all available checkpoints in `data/models/`. Shows file size and tokenizer info (if metadata exists).
 
+### `chat`
+Starts interactive chat with LLMTeacher. Options:
+- `--checkpoint <path>` - Model checkpoint to use.
+- `--latest` - Use the most recent checkpoint.
+- `--temperature <float>` - Sampling temperature (default: 0.8).
+- `--top-k <int>` - Top-k sampling parameter (default: 50).
+- `--max-tokens <int>` - Max tokens per response (default: 100).
+
+Example:
+```bash
+python llmteacher.py chat --latest
+You: Hello!
+LLM: Hello there! How can I help you today?
+```
+
+**Warning:** If the checkpoint's tokenizer doesn't match current config, you'll get a warning and incorrect responses.
+
 ### `history`
 Shows last N commands from `history.log`. Use `-n <int>` to change number of entries.
 Tokenizer usage is automatically logged when training starts.

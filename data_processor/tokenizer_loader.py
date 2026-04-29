@@ -8,10 +8,10 @@ from transformers import AutoTokenizer
 _config_cache = None
 
 def get_model_config():
-    global _config_cache
-    if _config_cache is None:
-        _config_cache = json.loads(Path("config/model_config.json").read_text())
-    return _config_cache
+    # Get the project root (where config/ dir is located)
+    project_root = Path(__file__).resolve().parent.parent
+    config_path = project_root / "config" / "model_config.json"
+    return json.loads(config_path.read_text())
 
 def get_training_config():
     return json.loads(Path("config/training_config.json").read_text())

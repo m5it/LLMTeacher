@@ -1,2 +1,2 @@
 from .process import processor_gemma3_tokenizer, processor_gpt2_tokenizer
-from .tokenizer_loader import get_tokenizer, get_tokenizer_name, get_model_config, get_training_config, save_checkpoint_metadata, get_vocab_size
+from .tokenizer_loader import get_tokenizer, get_tokenizer_name, get_model_config, get_training_config, save_checkpoint_metadata, get_vocab_size, log_tokenizer_usage

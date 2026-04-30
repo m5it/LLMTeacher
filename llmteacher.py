@@ -15,6 +15,7 @@ Usage:
 """
 
 import os
+import sys
 import argparse
 import torch
 import numpy as np
@@ -27,8 +28,7 @@ from datetime import datetime
 from architecture import Gemma3Model, model_config
 from training import (
     learning_rate, max_iters, warmup_steps, min_lr, eval_iters,
-    batch_size, block_size, gradient_accumulation_steps, device,
-    device_type, dtype, ctx, get_batch, estimate_loss
+    batch_size, block_size, gradient_accumulation_steps, dtype, get_batch, estimate_loss
 )
 from data_processor import processor_gpt2_tokenizer, get_tokenizer, get_tokenizer_name, save_checkpoint_metadata, get_vocab_size, log_tokenizer_usage
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
@@ -224,9 +224,43 @@ def combine_datasets():
     print("Dataset combination complete.")
 
 
-def train(checkpoint_path=None, output_path=None):
+def train(checkpoint_path=None, output_path=None, device_arg=None):
     """Train model from scratch or continue from checkpoint."""
     wandb.login()
+
+    # Show available devices
+    print(f"\nAvailable devices:")
+    print(f"  CPU: {os.cpu_count()} cores")
+    if torch.cuda.is_available():
+        print(f"  CUDA: {torch.cuda.device_count()} device(s)")
+        for i in range(torch.cuda.device_count()):
+            print(f"    [{i}] {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB)")
+    else:
+        print(f"  CUDA: Not available")
+
+    # Device selection
+    if device_arg:
+        device = device_arg
+        print(f"\nUsing specified device: {device}")
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"\nUsing default device: {device}")
+
+    # Update device_type and ctx for training - MUST update module-level variables
+    device_type = 'cuda' if 'cuda' in device else 'cpu'
+    dtype = 'bfloat16' if device == 'cuda' and torch.cuda.is_bf16_supported() else 'float16'
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+    ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device, dtype=ptdtype)
+    
+    # Update training module variables so get_batch and loss use correct device
+    import training
+    training.device_type = device_type
+    training.ctx = ctx
+    training.dtype = dtype
+    
+    print(f"✅ Device confirmed: {device} (type: {device_type})")
+    print(f"   Model will use: {device}")
+    print(f"   Autocast context: {ctx}")
 
     # Auto-generate output path if not specified
     if output_path is None:
@@ -314,6 +348,7 @@ def train(checkpoint_path=None, output_path=None):
         "batch_size": batch_size,
         "block_size": block_size,
         "tokenizer": get_tokenizer_name(),
+        "device": device,
     }
 
     best_val_loss = float('inf')
@@ -323,6 +358,24 @@ def train(checkpoint_path=None, output_path=None):
     with wandb.init(project="pretraining-gemma3_270b", config=training_config_log) as run:
         model = model.to(device)
         run.watch(model, log_freq=100)
+
+        # Confirmation prompt (only in interactive mode)
+        if sys.stdin.isatty():
+            print(f"\n{'='*60}")
+            print(f"TRAINING CONFIGURATION")
+            print(f"{'='*60}")
+            print(f"Device: {device}")
+            print(f"Checkpoint: {checkpoint_path or 'Training from scratch'}")
+            print(f"Output: {output_path}")
+            print(f"Learning rate: {learning_rate} (min_lr: {min_lr})")
+            print(f"Iterations: {max_iters:,}")
+            print(f"Batch size: {batch_size}, Block size: {block_size}")
+            print(f"Tokenizer: {get_tokenizer_name()}")
+            print(f"{'='*60}\n")
+            response = input("Do you really want to continue? (Y/n): ")
+            if response.lower() == 'n':
+                print("Training cancelled.")
+                return
 
         for epoch in tqdm(range(max_iters)):
             if epoch % eval_iters == 0 and epoch != 0:
@@ -340,7 +393,7 @@ def train(checkpoint_path=None, output_path=None):
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     torch.save(model.state_dict(), best_model_path)
-                    save_checkpoint_metadata(best_model_path, {"val_loss": val_loss, "epoch": epoch})
+                    save_checkpoint_metadata(best_model_path, {"val_loss": val_loss.item() if hasattr(val_loss, 'item') else val_loss, "epoch": epoch})
                     wandb.log({"best_model_saved_at_epoch": epoch, "best_val_loss": best_val_loss}, step=epoch)
 
             X, y = get_batch("train", block_size, batch_size, device, device_type)
@@ -400,6 +453,13 @@ def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100,
     print(f"Checkpoint: {checkpoint_path}")
     checkpoint_size = Path(checkpoint_path).stat().st_size / (1024 * 1024)
     print(f"Checkpoint size: {checkpoint_size:.1f} MB")
+
+    # Load checkpoint to check vocab size
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    ckpt_vocab_size = ckpt['tok_emb.weight'].shape[0]
+    if ckpt_vocab_size != model_config['vocab_size']:
+        print(f"Adjusting vocab_size from {model_config['vocab_size']} to {ckpt_vocab_size} (from checkpoint)")
+        model_config['vocab_size'] = ckpt_vocab_size
 
     # Load model to get parameter count
     model_config["dtype"] = torch.bfloat16
@@ -544,6 +604,12 @@ def main():
     # Combine datasets
     subparsers.add_parser("combine-datasets", help="Combine TinyStories + ROCStories into single files")
 
+    # Prepare conversational datasets
+    conv_parser = subparsers.add_parser("prepare-conv", help="Download and process conversational datasets")
+    conv_parser.add_argument("--dataset", type=str, default="discord", choices=["discord", "dailydialog"],
+                        help="Conversational dataset to prepare (discord/dailydialog)")
+    conv_parser.add_argument("--max-samples", type=int, default=100000, help="Max samples to process")
+
     # Prepare CodeSearchNet
     codesearch_parser = subparsers.add_parser("prepare-codesearch", help="Download and process CodeSearchNet dataset")
     codesearch_parser.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer to use")
@@ -555,11 +621,13 @@ def main():
     train_parser = subparsers.add_parser("train", help="Train model from scratch")
     train_parser.add_argument("--checkpoint", type=str, help="Continue training from checkpoint")
     train_parser.add_argument("--output", type=str, default=None, help="Output checkpoint path (auto-generated if not set)")
+    train_parser.add_argument("--device", type=str, default=None, help="Device to use (cuda, cpu, or cuda:0). Default: from config")
 
     # Continue (alias for train with checkpoint)
     continue_parser = subparsers.add_parser("continue", help="Continue training from checkpoint")
     continue_parser.add_argument("checkpoint", type=str, help="Checkpoint path to continue from")
     continue_parser.add_argument("--output", type=str, default=None, help="Output checkpoint path (auto-generated if not set)")
+    continue_parser.add_argument("--device", type=str, default=None, help="Device to use (cuda, cpu). Default: from config")
 
     # Generate
     gen_parser = subparsers.add_parser("generate", help="Generate text from prompt")
@@ -608,15 +676,19 @@ def main():
         from data_processor.codesearchnet import combine_with_codesearchnet
         combine_with_codesearchnet()
     elif args.command == "train":
-        train(args.checkpoint, args.output)
+        train(args.checkpoint, args.output, args.device)
     elif args.command == "continue":
-        train(args.checkpoint, args.output)
+        train(args.checkpoint, args.output, args.device)
     elif args.command == "generate":
         generate(args.prompt, args.checkpoint, args.latest, args.max_tokens, args.temperature, args.top_k)
     elif args.command == "list-checkpoints":
         list_checkpoints()
     elif args.command == "chat":
         chat(args.checkpoint, args.latest, args.temperature, args.top_k, args.max_tokens)
+    elif args.command == "prepare-conv":
+        from data_processor.conversation_datasets import process_conversational_data, combine_with_conversational_data
+        process_conversational_data(tokenizer_name="gpt2", dataset_name=args.dataset, max_samples=args.max_samples)
+        combine_with_conversational_data()
     elif args.command == "history":
         show_history(args.n)
 
@@ -662,8 +734,27 @@ def chat(checkpoint_path=None, use_latest=False, temperature=0.8, top_k=50, max_
         except:
             pass
 
-    # Load model
+    # Load model - check vocab size from checkpoint first
     model_config["dtype"] = torch.bfloat16
+    
+    # Auto-adjust vocab_size to match checkpoint
+    if os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        ckpt_vocab_size = ckpt['tok_emb.weight'].shape[0]
+        if ckpt_vocab_size != model_config.get('vocab_size', 0):
+            print("\n" + "!" * 80)
+            print("⚠️  VOCAB SIZE MISMATCH DETECTED!")
+            print("!" * 80)
+            print(f"  Checkpoint vocab_size: {ckpt_vocab_size:,}")
+            print(f"  Current model_config vocab_size: {model_config.get('vocab_size')}")
+            print(f"\n  This usually means the checkpoint was trained with a different tokenizer.")
+            print(f"\n  To fix this, update config/model_config.json:")
+            print(f"    1. Set vocab_size to {ckpt_vocab_size}")
+            print(f"    2. Or set tokenizer to match the checkpoint")
+            print(f"\n  Auto-adjusting vocab_size to {ckpt_vocab_size} for this session...")
+            print("!" * 80 + "\n")
+            model_config['vocab_size'] = ckpt_vocab_size
+    
     torch.manual_seed(123)
     model = Gemma3Model(model_config)
     print(f"\nLoading checkpoint: {checkpoint_path}")
@@ -746,7 +837,10 @@ def chat(checkpoint_path=None, use_latest=False, temperature=0.8, top_k=50, max_
                 next_token = torch.multinomial(probs, num_samples=1)
                 tokens = torch.cat((tokens, next_token), dim=1)
                 generated_tokens.append(next_token.item())
-                if next_token.item() == (enc.eos_token_id if hasattr(enc, 'eos_token_id') else 0):
+                eos_id = getattr(enc, 'eos_token_id', None)
+                if tokenizer_name == "gpt2":
+                    eos_id = 50256
+                if eos_id is not None and next_token.item() == eos_id:
                     break
 
         response = decode_fn(generated_tokens)

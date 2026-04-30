@@ -25,7 +25,12 @@ block_size = training_config["block_size"] #changed from 64, capture longer rang
 
 gradient_accumulation_steps = training_config["gradient_accumulation_steps"] # reduced from 50
 
-device = training_config["device"] if torch.cuda.is_available() else "cpu"
+# Device selection: use config value, fallback to cuda if available, else cpu
+config_device = training_config.get("device", "cuda")
+if config_device == "cuda" and not torch.cuda.is_available():
+    device = "cpu"
+else:
+    device = config_device
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 

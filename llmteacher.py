@@ -16,6 +16,7 @@ Usage:
 
 import os
 import sys
+import json
 import argparse
 import torch
 import numpy as np
@@ -23,6 +24,17 @@ from datasets import load_dataset
 from tqdm.auto import tqdm
 from pathlib import Path
 from datetime import datetime
+
+# GLOBAL DEVICE VARIABLE - set once and used everywhere
+# ALWAYS default to CUDA - fail immediately if CUDA not available
+# This ensures we NEVER accidentally use CPU
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+    DEVICE_TYPE = "cuda"
+    print(f"✅ CUDA available: {torch.cuda.get_device_name(0)}")
+else:
+    raise RuntimeError("CUDA not available! This code requires CUDA. Check your PyTorch installation.")
+CTX = None  # Will be set in train()/generate()/chat()
 
 # Project imports
 from architecture import Gemma3Model, model_config
@@ -32,7 +44,15 @@ from training import (
 )
 from data_processor import processor_gpt2_tokenizer, get_tokenizer, get_tokenizer_name, save_checkpoint_metadata, get_vocab_size, log_tokenizer_usage
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
-import wandb
+from contextlib import nullcontext
+
+# Optional W&B support
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
 
 
 HISTORY_LOG = Path("history.log")
@@ -67,11 +87,14 @@ def show_history(n=10):
 
 
 def prepare_data():
-    """Download TinyStories and tokenize to binary files."""
+    """Download TinyStories and tokenize to binary files with metadata for chunking."""
     print("Loading TinyStories dataset...")
     ds = load_dataset("roneneldan/TinyStories")
 
-    if os.path.exists("data/processed_datasets/train.bin"):
+    output_dir = Path("data/processed_datasets")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if os.path.exists(output_dir / "train.bin"):
         print("Dataset already prepared. Skipping.")
         return
 
@@ -97,18 +120,40 @@ def prepare_data():
 
     for split, dset in tokenized.items():
         arr_len = np.sum(dset['len'], dtype=np.uint64)
-        filename = f'data/processed_datasets/{split}.bin'
+        filename = output_dir / f'{split}.bin'
         dtype_np = np.uint16
         arr = np.memmap(filename, dtype=dtype_np, mode='w+', shape=(arr_len,))
-        total_batches = 1024
 
+        # Store metadata: cumulative token positions for each story (for chunking)
+        story_boundaries = []  # List of (story_index, start_token_position)
+        current_pos = 0
+
+        total_batches = 1024
         idx = 0
         for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
             batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format('numpy')
             arr_batch = np.concatenate(batch['ids'])
             arr[idx: idx + len(arr_batch)] = arr_batch
+
+            # Track story boundaries from this batch
+            for i, story_len in enumerate(batch['len']):
+                story_boundaries.append((idx + current_pos, story_len))
+                current_pos += story_len
+
             idx += len(arr_batch)
         arr.flush()
+
+        # Save metadata for chunking
+        meta = {
+            "total_tokens": int(arr_len),
+            "num_stories": len(story_boundaries),
+            "story_boundaries": story_boundaries,  # [(start_pos, length), ...]
+            "tokenizer": tokenizer_name
+        }
+        meta_path = filename.with_suffix('.bin.meta.json')
+        Path(meta_path).write_text(json.dumps(meta))
+        print(f"Saved metadata to {meta_path}")
+
     print("Data preparation complete.")
 
 
@@ -223,11 +268,147 @@ def combine_datasets():
 
     print("Dataset combination complete.")
 
+def prepare_random(txt_path):
+    """Tokenize a .txt file to .bin format for training."""
+    txt_path = Path(txt_path)
+    if not txt_path.exists():
+        print(f"File not found: {txt_path}")
+        return
 
-def train(checkpoint_path=None, output_path=None, device_arg=None):
+    bin_path = txt_path.with_suffix('.bin')
+    meta_path = bin_path.with_suffix('').with_suffix('.bin.meta.json')
+
+    print(f"Processing {txt_path.name}...")
+
+    # Read all lines (one example per line)
+    with open(txt_path, 'r') as f:
+        examples = [line.strip() for line in f if line.strip()]
+
+    print(f"Found {len(examples):,} examples")
+
+    # Get tokenizer
+    tokenizer_name = get_tokenizer_name()
+    if tokenizer_name == "gpt2":
+        import tiktoken
+        enc = tiktoken.get_encoding("gpt2")
+        encode_fn = lambda text: enc.encode_ordinary(text)
+    else:
+        raise ValueError(f"Unsupported tokenizer: {tokenizer_name}")
+
+    # Tokenize all examples
+    all_tokens = []
+    story_boundaries = []
+    current_pos = 0
+
+    for example in tqdm(examples, desc="Tokenizing"):
+        tokens = encode_fn(example)
+        all_tokens.extend(tokens)
+        story_boundaries.append((current_pos, len(tokens)))
+        current_pos += len(tokens)
+
+    # Save binary
+    arr = np.array(all_tokens, dtype=np.uint16)
+    arr.tofile(bin_path)
+    print(f"Saved {len(all_tokens):,} tokens to {bin_path} ({arr.nbytes / 1024 / 1024:.1f} MB)")
+
+    # Save metadata for chunking
+    meta = {
+        "total_tokens": int(len(all_tokens)),
+        "num_stories": len(examples),
+        "story_boundaries": story_boundaries,
+        "tokenizer": tokenizer_name
+    }
+    meta_path.write_text(json.dumps(meta))
+    print(f"Saved metadata to {meta_path}")
+
+
+def prepare_next_chunk():
+    """Prepare next data chunk using metadata to skip already-used stories."""
+    from pathlib import Path
+    progress_file = Path("data/training_progress.json")
+
+    if not progress_file.exists():
+        print("No progress file found. Run training first.")
+        return
+
+    try:
+        progress = json.loads(progress_file.read_text())
+        last_iter = progress.get("epoch", 0)  # epoch = iterations in our code
+        print(f"Last training iteration: {last_iter:,}")
+    except:
+        print("Could not read progress file.")
+        return
+
+    # Load TinyStories metadata
+    meta_path = Path("data/processed_datasets/train.bin.meta.json")
+    if not meta_path.exists():
+        print("No metadata found. Run prepare first.")
+        return
+
+    meta = json.loads(meta_path.read_text())
+    story_boundaries = meta["story_boundaries"]
+
+    # Calculate tokens processed: iterations * batch_size * block_size
+    # Use values from config (or approximate)
+    approx_tokens_processed = last_iter * 2 * 512  # batch_size=2, block_size=512
+    print(f"Approx tokens processed: {approx_tokens_processed:,}")
+
+    # Find which story this corresponds to
+    stories_to_skip = 0
+    for i, (pos, length) in enumerate(story_boundaries):
+        if pos < approx_tokens_processed:
+            stories_to_skip = i + 1
+        else:
+            break
+
+    stories_to_skip = min(stories_to_skip, len(story_boundaries) - 1000)
+    stories_to_skip = max(stories_to_skip, 0)
+
+    print(f"Dataset has {len(story_boundaries):,} stories")
+    print(f"Skipping first {stories_to_skip:,} stories for next chunk...")
+
+    # Read original binary and skip to new starting point
+    train_bin = Path("data/processed_datasets/train.bin")
+    data = np.memmap(train_bin, dtype=np.uint16, mode='r')
+
+    start_pos = story_boundaries[stories_to_skip][0] if stories_to_skip > 0 else 0
+    remaining_tokens = len(data) - start_pos
+
+    print(f"New chunk: {remaining_tokens:,} tokens (starting from story {stories_to_skip:,})")
+
+    # Save new chunk
+    chunk_path = Path("data/processed_datasets/train_chunk.bin")
+    chunk_data = np.array(data[start_pos:], dtype=np.uint16)
+    chunk_data.tofile(chunk_path)
+    print(f"Saved chunk to {chunk_path} ({len(chunk_data):,} tokens)")
+
+    print("\nNext chunk ready! Training will use the new chunk automatically.")
+    print(f"Run: python llmteacher.py continue <checkpoint> --device cuda")
+
+def train(checkpoint_path=None, output_path=None, device_arg=None, block_size_override=None, train_data_path=None):
     """Train model from scratch or continue from checkpoint."""
-    wandb.login()
+    global DEVICE, DEVICE_TYPE, CTX, block_size
 
+    # Set custom train data path (for get_batch.py)
+    if train_data_path:
+        import training.get_batch as get_batch_module
+        get_batch_module.TRAIN_DATA_PATH = train_data_path
+        print(f"Training on custom data: {train_data_path}")
+
+    # Use block_size from config, unless overridden by command line
+    if block_size_override is not None:
+        block_size = block_size_override
+        print(f"Block size overridden to: {block_size}")
+    else:
+        print(f"Using block_size from config: {block_size}")
+    
+    # W&B login if available
+    if WANDB_AVAILABLE:
+        try:
+            wandb.login()
+        except:
+            print("W&B login failed - continuing without W&B logging")
+    
     # Show available devices
     print(f"\nAvailable devices:")
     print(f"  CPU: {os.cpu_count()} cores")
@@ -237,30 +418,22 @@ def train(checkpoint_path=None, output_path=None, device_arg=None):
             print(f"    [{i}] {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB)")
     else:
         print(f"  CUDA: Not available")
-
-    # Device selection
+    
+    # Device selection - only override global DEVICE if explicitly specified
     if device_arg:
-        device = device_arg
-        print(f"\nUsing specified device: {device}")
+        DEVICE = device_arg
+        print(f"\nUsing specified device: {DEVICE}")
     else:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"\nUsing default device: {device}")
-
-    # Update device_type and ctx for training - MUST update module-level variables
-    device_type = 'cuda' if 'cuda' in device else 'cpu'
-    dtype = 'bfloat16' if device == 'cuda' and torch.cuda.is_bf16_supported() else 'float16'
+        print(f"\nUsing global DEVICE: {DEVICE}")
+    
+    # Update DEVICE_TYPE and CTX based on current DEVICE
+    DEVICE_TYPE = 'cuda' if 'cuda' in DEVICE else 'cpu'
+    dtype = 'bfloat16' if DEVICE == 'cuda' and torch.cuda.is_bf16_supported() else 'float16'
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-    ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device, dtype=ptdtype)
+    CTX = nullcontext() if DEVICE == 'cpu' else torch.amp.autocast(device_type=DEVICE, dtype=ptdtype)
     
-    # Update training module variables so get_batch and loss use correct device
-    import training
-    training.device_type = device_type
-    training.ctx = ctx
-    training.dtype = dtype
-    
-    print(f"✅ Device confirmed: {device} (type: {device_type})")
-    print(f"   Model will use: {device}")
-    print(f"   Autocast context: {ctx}")
+    print(f"✅ DEVICE confirmed: {DEVICE} (type: {DEVICE_TYPE})")
+    print(f"   CTX: {CTX}")
 
     # Auto-generate output path if not specified
     if output_path is None:
@@ -321,11 +494,11 @@ def train(checkpoint_path=None, output_path=None, device_arg=None):
             print(f"   If checkpoint was trained with a different tokenizer, results will be wrong!\n")
 
         print(f"Loading checkpoint: {checkpoint_path}")
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
     elif checkpoint_path:
         print(f"Checkpoint not found: {checkpoint_path}. Training from scratch.")
 
-    torch.set_default_device(device)
+    torch.set_default_device(DEVICE)
     torch.manual_seed(42)
 
     optimizer = torch.optim.AdamW(
@@ -335,9 +508,22 @@ def train(checkpoint_path=None, output_path=None, device_arg=None):
 
     scheduler_warmup = LinearLR(optimizer, total_iters=warmup_steps)
     scheduler_decay = CosineAnnealingLR(optimizer, T_max=max_iters - warmup_steps, eta_min=min_lr)
+    
+    # Move model to device FIRST
+    model = model.to(DEVICE)
+    
+    # Suppress PyTorch warning about scheduler.step() before optimizer.step()
+    # by doing a dummy optimizer step with actual model parameters
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+    
     scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_decay], milestones=[warmup_steps])
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
 
     training_config_log = {
         "learning_rate": learning_rate,
@@ -348,72 +534,271 @@ def train(checkpoint_path=None, output_path=None, device_arg=None):
         "batch_size": batch_size,
         "block_size": block_size,
         "tokenizer": get_tokenizer_name(),
-        "device": device,
+        "device": DEVICE,
     }
 
     best_val_loss = float('inf')
     best_model_path = output_path
     Path("data/models").mkdir(parents=True, exist_ok=True)
-
-    with wandb.init(project="pretraining-gemma3_270b", config=training_config_log) as run:
-        model = model.to(device)
+    
+    # W&B init - skip if SSL errors
+    run = None
+    if WANDB_AVAILABLE:
+        try:
+            run = wandb.init(project="pretraining-gemma3_270b", config=training_config_log)
+            print("W&B logging enabled")
+        except Exception as e:
+            print(f"W&B init failed (continuing without W&B): {e}")
+            run = None
+    else:
+        print("W&B not available, skipping...")
+    
+    # Model to device
+    model = model.to(DEVICE)
+    
+    # Watch model if W&B available
+    if run:
         run.watch(model, log_freq=100)
-
-        # Confirmation prompt (only in interactive mode)
-        if sys.stdin.isatty():
-            print(f"\n{'='*60}")
-            print(f"TRAINING CONFIGURATION")
-            print(f"{'='*60}")
-            print(f"Device: {device}")
-            print(f"Checkpoint: {checkpoint_path or 'Training from scratch'}")
-            print(f"Output: {output_path}")
-            print(f"Learning rate: {learning_rate} (min_lr: {min_lr})")
-            print(f"Iterations: {max_iters:,}")
-            print(f"Batch size: {batch_size}, Block size: {block_size}")
-            print(f"Tokenizer: {get_tokenizer_name()}")
-            print(f"{'='*60}\n")
-            response = input("Do you really want to continue? (Y/n): ")
-            if response.lower() == 'n':
-                print("Training cancelled.")
-                return
-
+    
+    # Confirmation prompt (only in interactive mode)
+    if sys.stdin.isatty():
+        print(f"\n{'='*60}")
+        print(f"TRAINING CONFIGURATION")
+        print(f"{'='*60}")
+        print(f"Device: {DEVICE}")
+        print(f"Checkpoint: {checkpoint_path or 'Training from scratch'}")
+        print(f"Output: {output_path}")
+        print(f"Learning rate: {learning_rate} (min_lr: {min_lr})")
+        print(f"Iterations: {max_iters:,}")
+        print(f"Batch size: {batch_size}, Block size: {block_size}")
+        print(f"Tokenizer: {get_tokenizer_name()}")
+        print(f"{'='*60}\n")
+        response = input("Do you really want to continue? (Y/n): ")
+        if response.lower() == 'n':
+            print("Training cancelled.")
+            return
+    
+    # Progress file path
+    progress_file = Path("data/training_progress.json")
+    
+    # Load previous progress if continuing
+    start_epoch = 0
+    if checkpoint_path and os.path.exists(progress_file):
+        try:
+            progress = json.loads(progress_file.read_text())
+            start_epoch = progress.get("epoch", 0)
+            print(f"Resuming from epoch {start_epoch}")
+        except:
+            pass
+    
+    try:
         for epoch in tqdm(range(max_iters)):
+            if epoch < start_epoch:
+                continue  # Skip already processed epochs
+            
             if epoch % eval_iters == 0 and epoch != 0:
-                losses = estimate_loss(model, eval_iters, ctx, block_size, batch_size, device, device_type)
+                losses = estimate_loss(model, eval_iters, CTX, block_size, batch_size, DEVICE, DEVICE_TYPE)
                 train_loss, val_loss = losses['train'], losses['val']
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"Epoch {epoch}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
                 print(f"Learning rate: {current_lr:.5f}")
-                wandb.log({
-                    "epoch": epoch, "train_loss": train_loss,
-                    "val_loss": val_loss, "learning_rate": current_lr,
-                    "best_val_loss": best_val_loss
-                }, step=epoch)
+                if run:
+                    wandb.log({
+                        "epoch": epoch, "train_loss": train_loss,
+                        "val_loss": val_loss, "learning_rate": current_lr,
+                        "best_val_loss": best_val_loss
+                    }, step=epoch)
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     torch.save(model.state_dict(), best_model_path)
                     save_checkpoint_metadata(best_model_path, {"val_loss": val_loss.item() if hasattr(val_loss, 'item') else val_loss, "epoch": epoch})
-                    wandb.log({"best_model_saved_at_epoch": epoch, "best_val_loss": best_val_loss}, step=epoch)
+                    if run:
+                        wandb.log({"best_model_saved_at_epoch": epoch, "best_val_loss": best_val_loss}, step=epoch)
 
-            X, y = get_batch("train", block_size, batch_size, device, device_type)
-            X, y = X.to(device), y.to(device)
+            X, y = get_batch("train", block_size, batch_size, DEVICE, DEVICE_TYPE)
+            X, y = X.to(DEVICE), y.to(DEVICE)
 
-            with ctx:
+            with CTX:
                 logits, loss = model(X, y)
                 loss = loss / gradient_accumulation_steps
                 scaler.scale(loss).backward()
-                wandb.log({"batch_loss": loss.item()}, step=epoch)
+                if run:
+                    wandb.log({"batch_loss": loss.item()}, step=epoch)
 
             if ((epoch + 1) % gradient_accumulation_steps == 0) or (epoch + 1 == max_iters):
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                wandb.log({"grad_norm": grad_norm}, step=epoch)
+                if run:
+                    wandb.log({"grad_norm": grad_norm}, step=epoch)
                 scaler.step(optimizer)
                 scaler.update()
+                scheduler.step()  # Now called AFTER optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
+            else:
+                scheduler.step()  # Still call for iterations without optimizer step
+            
+            # Save progress periodically
+            if epoch % 1000 == 0:
+                progress_file.write_text(json.dumps({"epoch": epoch, "checkpoint": checkpoint_path or output_path}))
+                
+    except KeyboardInterrupt:
+        print(f"\n\n{'='*60}")
+        print(f"TRAINING INTERRUPTED AT EPOCH {epoch}")
+        print(f"{'='*60}\n")
 
+        # Save current state
+        interrupt_path = output_path.replace(".pt", "_interrupted.pt")
+        torch.save(model.state_dict(), interrupt_path)
+        progress_file.write_text(json.dumps({"epoch": epoch, "checkpoint": output_path}))
+        print(f"Saved interrupt checkpoint: {interrupt_path}")
+
+        # Generate new dataset chunk from remaining data
+        print(f"\nGenerating new dataset chunk from remaining stories...")
+        prepare_next_chunk()
+
+        print("\nTraining interrupted. To continue with new data, run:")
+        print(f"  python llmteacher.py continue {interrupt_path} --device cuda\n")
+        return
+    
+    # Save final progress
+    progress_file.write_text(json.dumps({"epoch": max_iters, "checkpoint": output_path}))
     print("Training complete.")
+
+
+def list_datasets():
+    """List all processed datasets with sample counts and sizes."""
+    from pathlib import Path
+    import json
+
+    print("\n" + "="*60)
+    print(" "*15 + "Available Datasets")
+    print("="*60)
+
+    ds_dir = Path("data/processed_datasets")
+
+    datasets = [
+        ("train.bin", "TinyStories"),
+        ("train_combined.bin", "TinyStories + ROCStories"),
+        ("train_with_code.bin", "+ CodeSearchNet"),
+        ("train_with_conversation.bin", "+ Conversational"),
+        ("codesearchnet_train.bin", "CodeSearchNet"),
+        ("discord_train.bin", "Discord-Dialogues"),
+        ("dailydialog_train.bin", "DailyDialog"),
+        ("topical_chat_train.bin", "Topical-Chat"),
+        ("validation.bin", "Validation"),
+        ("train_chunk.bin", "Chunk (remaining)"),
+    ]
+
+    for fname, desc in datasets:
+        fpath = ds_dir / fname
+        if fpath.exists():
+            size_mb = fpath.stat().st_size / (1024 * 1024)
+
+            # Try to load metadata for sample count
+            meta_path = fpath.with_suffix('').with_suffix('.bin.meta.json')
+            if not meta_path.exists():
+                meta_path = fpath.parent / (fpath.stem + ".bin.meta.json")
+
+            sample_info = ""
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                    samples = meta.get("num_stories", meta.get("num_samples", None))
+                    if samples:
+                        sample_info = f" [Samples: {samples:,}]"
+                except:
+                    pass
+
+            print(f"  ✅ {fname:35s} ({size_mb:7.1f} MB) - {desc}{sample_info}")
+        else:
+            print(f"  ❌ {fname:35s} (not found) - {desc}")
+
+    print("="*60)
+
+
+def preview():
+    """Show current configuration, datasets, and checkpoints."""
+    from pathlib import Path
+    import torch
+    import json
+
+    print("\n" + "="*60)
+    print(" "*15 + "LLMTeacher Configuration Preview")
+    print("="*60)
+
+    # Device status
+    print(f"\n🔧 DEVICE STATUS")
+    if torch.cuda.is_available():
+        print(f"  CUDA: ✅ {torch.cuda.get_device_name(0)}")
+        print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    else:
+        print(f"  CUDA: ❌ Not available")
+    print(f"  Config default: {DEVICE}")
+
+    # Model config
+    print(f"\n📦 MODEL CONFIG (config/model_config.json)")
+    try:
+        mc = json.loads(Path("config/model_config.json").read_text())
+        print(f"  Vocab size: {mc.get('vocab_size', '?')} ({mc.get('tokenizer', '?')})")
+        print(f"  Layers: {mc.get('n_layers', '?')} (sliding + full attention)")
+        print(f"  Embedding dim: {mc.get('emb_dim', '?')}")
+        print(f"  Heads: {mc.get('n_heads', '?')}, Head dim: {mc.get('head_dim', '?')}")
+        print(f"  Context length: {mc.get('context_length', '?')}")
+    except:
+        print(f"  Config not found")
+
+    # Training config
+    print(f"\n⚙️  TRAINING CONFIG (config/training_config.json)")
+    try:
+        tc = json.loads(Path("config/training_config.json").read_text())
+        print(f"  Learning rate: {tc.get('learning_rate', '?')} (min: {tc.get('min_lr', '?')})")
+        print(f"  Max iterations: {tc.get('max_iters', '?')}")
+        print(f"  Batch size: {tc.get('batch_size', '?')}, Block size: {tc.get('block_size', '?')}")
+        print(f"  Gradient accumulation: {tc.get('gradient_accumulation_steps', '?')}")
+        print(f"  Warmup steps: {tc.get('warmup_steps', '?')}")
+        print(f"  Scheduler: {tc.get('lr_scheduler_type', '?')}")
+    except:
+        print(f"  Config not found")
+
+    # Tokenizer
+    print(f"\n🔤 TOKENIZER")
+    print(f"  Type: {get_tokenizer_name()}")
+
+    # Available datasets
+    list_datasets()
+
+    # Checkpoints
+    print(f"\n💾 CHECKPOINTS (data/models/)")
+    ckpt_dir = Path("data/models")
+    if ckpt_dir.exists():
+        checkpoints = list(ckpt_dir.glob("*.pt"))
+        if checkpoints:
+            # Find latest
+            latest = max(checkpoints, key=lambda p: p.stat().st_mtime)
+            print(f"  Latest: {latest.name} ({latest.stat().st_size / 1024**2:.1f} MB)")
+            print(f"  Total: {len(checkpoints)} checkpoints")
+        else:
+            print(f"  No checkpoints found")
+    else:
+        print(f"  No checkpoint directory")
+
+    # Training progress
+    progress_file = Path("data/training_progress.json")
+    if progress_file.exists():
+        try:
+            progress = json.loads(progress_file.read_text())
+            print(f"\n📈 TRAINING PROGRESS")
+            print(f"  Last iteration: {progress.get('epoch', '?')}")
+            print(f"  Checkpoint: {progress.get('checkpoint', '?')}")
+        except:
+            pass
+
+    print("\n" + "="*60)
+    print("Quick actions:")
+    print("  Train:    python llmteacher.py train --block-size 512")
+    print("  Generate: python llmteacher.py generate --latest --prompt \"Once upon\"")
+    print("  Chat:     python llmteacher.py chat --latest")
+    print("="*60 + "\n")
 
 
 def get_latest_checkpoint():
@@ -429,6 +814,13 @@ def get_latest_checkpoint():
 
 def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100, temperature=0.8, top_k=50):
     """Generate text from a prompt."""
+    global DEVICE, DEVICE_TYPE, CTX
+    # Ensure DEVICE is set
+    if DEVICE is None:
+        DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+        DEVICE_TYPE = 'cuda' if 'cuda' in DEVICE else 'cpu'
+        print(f"Device auto-set to: {DEVICE}")
+    
     if use_latest:
         checkpoint_path = get_latest_checkpoint()
         if checkpoint_path:
@@ -454,8 +846,8 @@ def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100,
     checkpoint_size = Path(checkpoint_path).stat().st_size / (1024 * 1024)
     print(f"Checkpoint size: {checkpoint_size:.1f} MB")
 
-    # Load checkpoint to check vocab size
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    # Load checkpoint to check vocab size - use DEVICE not hardcoded cpu
+    ckpt = torch.load(checkpoint_path, map_location=DEVICE)
     ckpt_vocab_size = ckpt['tok_emb.weight'].shape[0]
     if ckpt_vocab_size != model_config['vocab_size']:
         print(f"Adjusting vocab_size from {model_config['vocab_size']} to {ckpt_vocab_size} (from checkpoint)")
@@ -485,7 +877,7 @@ def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100,
     print(f"  Max new tokens: {max_new_tokens}")
     print(f"  Temperature: {temperature}")
     print(f"  Top-k: {top_k}")
-    print(f"  Device: {device}")
+    print(f"  Device: {DEVICE}")
     print(f"{'='*60}\n")
 
     # Check tokenizer consistency for generation
@@ -510,8 +902,8 @@ def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100,
         except:
             pass
 
-    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
-    model = model.to(device)
+    model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
+    model = model.to(DEVICE)
     model.eval()
 
     tokenizer_name = get_tokenizer_name()
@@ -525,7 +917,7 @@ def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100,
         raise ValueError(f"Unsupported tokenizer: {tokenizer_name}")
 
     tokens = enc.encode(prompt)
-    tokens = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+    tokens = torch.tensor(tokens, dtype=torch.long, device=DEVICE).unsqueeze(0)
 
     with torch.no_grad():
         for _ in range(max_new_tokens):
@@ -603,31 +995,46 @@ def main():
 
     # Combine datasets
     subparsers.add_parser("combine-datasets", help="Combine TinyStories + ROCStories into single files")
-
-    # Prepare conversational datasets
-    conv_parser = subparsers.add_parser("prepare-conv", help="Download and process conversational datasets")
-    conv_parser.add_argument("--dataset", type=str, default="discord", choices=["discord", "dailydialog"],
-                        help="Conversational dataset to prepare (discord/dailydialog)")
-    conv_parser.add_argument("--max-samples", type=int, default=100000, help="Max samples to process")
-
-    # Prepare CodeSearchNet
+    
+    # Code dataset (separate - different block size!)
     codesearch_parser = subparsers.add_parser("prepare-codesearch", help="Download and process CodeSearchNet dataset")
     codesearch_parser.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer to use")
-
-    # Combine with CodeSearchNet
-    subparsers.add_parser("combine-with-code", help="Combine existing data with CodeSearchNet")
-
+    
     # Train
     train_parser = subparsers.add_parser("train", help="Train model from scratch")
     train_parser.add_argument("--checkpoint", type=str, help="Continue training from checkpoint")
     train_parser.add_argument("--output", type=str, default=None, help="Output checkpoint path (auto-generated if not set)")
     train_parser.add_argument("--device", type=str, default=None, help="Device to use (cuda, cpu, or cuda:0). Default: from config")
+    train_parser.add_argument("--block-size", type=int, default=None,
+                          help="Override block size from config (e.g. 128 for code, 512 for stories)")
+    train_parser.add_argument("--train-data", type=str, default=None,
+                          help="Path to specific .bin file for training (overrides automatic dataset selection)")
 
     # Continue (alias for train with checkpoint)
     continue_parser = subparsers.add_parser("continue", help="Continue training from checkpoint")
     continue_parser.add_argument("checkpoint", type=str, help="Checkpoint path to continue from")
     continue_parser.add_argument("--output", type=str, default=None, help="Output checkpoint path (auto-generated if not set)")
     continue_parser.add_argument("--device", type=str, default=None, help="Device to use (cuda, cpu). Default: from config")
+    continue_parser.add_argument("--block-size", type=int, default=None,
+                          help="Override block size from config")
+    continue_parser.add_argument("--train-data", type=str, default=None,
+                          help="Path to specific .bin file for training")
+
+    # Prepare random text file to .bin
+    prepare_random_parser = subparsers.add_parser("prepare_random", help="Tokenize .txt file to .bin")
+    prepare_random_parser.add_argument("txt_path", type=str, help="Path to .txt file (one example per line)")
+
+    # Prepare conversational dataset (Discord, DailyDialog, Topical-Chat)
+    conv_parser = subparsers.add_parser("prepare-conv", help="Process conversational dataset for chat training")
+    conv_parser.add_argument("--dataset", type=str, default="discord",
+                          choices=["discord", "dailydialog", "topical_chat"],
+                          help="Conversational dataset to process")
+    conv_parser.add_argument("--from-sample", type=int, default=None,
+                          help="Start sample index (for slicing dataset)")
+    conv_parser.add_argument("--to-sample", type=int, default=None,
+                          help="End sample index (exclusive, for slicing dataset)")
+    conv_parser.add_argument("--max-samples", type=int, default=100000,
+                          help="Maximum number of conversations to process (ignored if --from-sample/--to-sample set)")
 
     # Generate
     gen_parser = subparsers.add_parser("generate", help="Generate text from prompt")
@@ -653,6 +1060,12 @@ def main():
     history_parser = subparsers.add_parser("history", help="Show command history")
     history_parser.add_argument("-n", type=int, default=10, help="Number of recent commands to show")
 
+    # Preview configuration
+    subparsers.add_parser("preview", help="Show current configuration, datasets, and checkpoints")
+
+    # List datasets
+    subparsers.add_parser("datasets", help="List all processed datasets with sample counts")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -675,10 +1088,18 @@ def main():
     elif args.command == "combine-with-code":
         from data_processor.codesearchnet import combine_with_codesearchnet
         combine_with_codesearchnet()
+    elif args.command == "prepare-next-chunk":
+        prepare_next_chunk()
+    elif args.command == "prepare_random":
+        prepare_random(args.txt_path)
+    elif args.command == "datasets":
+        list_datasets()
+    elif args.command == "preview":
+        preview()
     elif args.command == "train":
-        train(args.checkpoint, args.output, args.device)
+        train(args.checkpoint, args.output, args.device, args.block_size, args.train_data)
     elif args.command == "continue":
-        train(args.checkpoint, args.output, args.device)
+        train(args.checkpoint, args.output, args.device, args.block_size, args.train_data)
     elif args.command == "generate":
         generate(args.prompt, args.checkpoint, args.latest, args.max_tokens, args.temperature, args.top_k)
     elif args.command == "list-checkpoints":
@@ -687,7 +1108,13 @@ def main():
         chat(args.checkpoint, args.latest, args.temperature, args.top_k, args.max_tokens)
     elif args.command == "prepare-conv":
         from data_processor.conversation_datasets import process_conversational_data, combine_with_conversational_data
-        process_conversational_data(tokenizer_name="gpt2", dataset_name=args.dataset, max_samples=args.max_samples)
+        process_conversational_data(
+            tokenizer_name="gpt2",
+            dataset_name=args.dataset,
+            max_samples=args.max_samples,
+            from_sample=args.from_sample,
+            to_sample=args.to_sample
+        )
         combine_with_conversational_data()
     elif args.command == "history":
         show_history(args.n)
@@ -695,6 +1122,13 @@ def main():
 
 def chat(checkpoint_path=None, use_latest=False, temperature=0.8, top_k=50, max_tokens=100):
     """Start interactive chat with LLMTeacher."""
+    global DEVICE, DEVICE_TYPE, CTX
+    # Ensure DEVICE is set
+    if DEVICE is None:
+        DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+        DEVICE_TYPE = 'cuda' if 'cuda' in DEVICE else 'cpu'
+        print(f"Device auto-set to: {DEVICE}")
+    
     if use_latest:
         checkpoint_path = get_latest_checkpoint()
         if checkpoint_path:
@@ -739,7 +1173,7 @@ def chat(checkpoint_path=None, use_latest=False, temperature=0.8, top_k=50, max_
     
     # Auto-adjust vocab_size to match checkpoint
     if os.path.exists(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        ckpt = torch.load(checkpoint_path, map_location=DEVICE)
         ckpt_vocab_size = ckpt['tok_emb.weight'].shape[0]
         if ckpt_vocab_size != model_config.get('vocab_size', 0):
             print("\n" + "!" * 80)
@@ -758,8 +1192,8 @@ def chat(checkpoint_path=None, use_latest=False, temperature=0.8, top_k=50, max_
     torch.manual_seed(123)
     model = Gemma3Model(model_config)
     print(f"\nLoading checkpoint: {checkpoint_path}")
-    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
-    model = model.to(device)
+    model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
+    model = model.to(DEVICE)
     model.eval()
 
     # Load tokenizer
@@ -820,7 +1254,7 @@ def chat(checkpoint_path=None, use_latest=False, temperature=0.8, top_k=50, max_
         if len(history_tokens) > block_size:
             history_tokens = history_tokens[-block_size:]
 
-        tokens = torch.tensor(history_tokens, dtype=torch.long, device=device).unsqueeze(0)
+        tokens = torch.tensor(history_tokens, dtype=torch.long, device=DEVICE).unsqueeze(0)
 
         # Generate response
         generated_tokens = []

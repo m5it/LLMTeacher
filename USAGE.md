@@ -11,10 +11,13 @@ python llmteacher.py prepare
 python llmteacher.py prepare-rocstories
 python llmteacher.py combine-datasets
 
-# 4. Train
+# 4. Preview configuration
+python llmteacher.py preview
+
+# 5. Train
 python llmteacher.py train --output data/models/run1.pt
 
-# 5. Generate text
+# 6. Generate text
 python llmteacher.py generate --latest --prompt "Once upon a time"
 ```
 
@@ -29,18 +32,38 @@ Processes ROCStories text files (`data/ROCStories/train*.txt`, `test.txt`) into 
 ### `combine-datasets`
 Combines TinyStories and ROCStories into single `train_combined.bin` and `validation_combined.bin` in `data/processed_datasets/`.
 
+### `preview`
+Shows current configuration, available datasets with sample counts, and checkpoints.
+```bash
+python llmteacher.py preview
+```
+Displays: device status, model config, training config, tokenizer, datasets (with sizes and sample counts), checkpoints, and training progress.
+
+### `datasets`
+Lists all processed datasets with sample counts and file sizes.
+```bash
+python llmteacher.py datasets
+```
+Shows: dataset name, file size, description, and sample count (if metadata exists).
+
 ### `train`
 Trains model from scratch. Options:
 - `--checkpoint <path>` - Continue from a checkpoint (same as `continue`).
 - `--output <path>` - Save checkpoint to a specific file. If not set, auto-generates a timestamped name like `data/models/model_lr{value}_{timestamp}.pt`.
+- `--block-size <int>` - Override block size from config (e.g., 512 for stories, 128 for code).
+- `--train-data <path>` - Use specific .bin file for training (overrides automatic dataset selection).
+- `--device <string>` - Device to use (cuda, cpu, cuda:0).
 
 ### `continue`
 Continues training from a checkpoint. First argument is the checkpoint path.
 - `--output <path>` - Output checkpoint path (auto-generated if omitted).
+- `--block-size <int>` - Override block size from config.
+- `--train-data <path>` - Use specific .bin file for training.
 
 Example:
 ```bash
 python llmteacher.py continue data/models/run1.pt --output data/models/run2.pt
+python llmteacher.py continue data/models/run1.pt --train-data data/processed_datasets/topical_chat_train.bin --block-size 512
 ```
 
 ### `generate`
@@ -80,6 +103,51 @@ LLM: Hello there! How can I help you today?
 ### `history`
 Shows last N commands from `history.log`. Use `-n <int>` to change number of entries.
 Tokenizer usage is automatically logged when training starts.
+
+### `prepare_random <txt_path>`
+Tokenizes any `.txt` file (one example per line) to `.bin` format for training.
+- Creates `.bin` file and `.bin.meta.json` (for chunking support) in same directory as input.
+- Uses tokenizer from config (gpt2/gemma3).
+
+Example:
+```bash
+python llmteacher.py prepare_random data/ROCStories/train1.txt
+# Creates: data/ROCStories/train1.bin + train1.bin.meta.json
+```
+
+### `prepare-conv`
+Processes conversational datasets (Discord, DailyDialog, Topical-Chat) for chat training.
+- `--dataset`: Choose dataset (discord, dailydialog, topical_chat).
+- `--max-samples`: Max conversations to process (default: 100,000).
+- `--from-sample`, `--to-sample`: Slice dataset range (exclusive end).
+
+Examples:
+```bash
+# Process Topical-Chat (local files in data/Topical-Chat/)
+python llmteacher.py prepare-conv --dataset topical_chat --max-samples 10000
+
+# Process Discord-Dialogues from HuggingFace
+python llmteacher.py prepare-conv --dataset discord
+
+# Slice dataset (process samples 10000-20000)
+python llmteacher.py prepare-conv --dataset topical_chat --from-sample 10000 --to-sample 20000
+```
+
+### `prepare-next-chunk`
+Prepares next training chunk by skipping already-used stories (based on training progress).
+- Reads `data/training_progress.json` to find last iteration.
+- Uses metadata in `.bin.meta.json` to skip to new stories.
+- Saves chunk to `data/processed_datasets/train_chunk.bin`.
+- Training auto-uses chunk file if it exists.
+
+Triggered automatically on Ctrl+C during training.
+
+### `prepare-codesearch`
+Downloads and processes CodeSearchNet dataset from HuggingFace.
+- `--tokenizer`: Tokenizer to use (default: gpt2).
+
+### `combine-with-code`
+Combines existing training data with CodeSearchNet into `train_with_codesearchnet.bin`.
 
 ## ⚙️ Tokenizer Setup#
 
@@ -175,6 +243,80 @@ python llmteacher.py combine-datasets
 python llmteacher.py train --output data/models/first_run.pt
 ```
 
+### Train on conversational dataset (Topical-Chat)#
+```bash
+# Prepare Topical-Chat dataset
+python llmteacher.py prepare-conv --dataset topical_chat --max-samples 10000
+
+# Train on conversation data only
+python llmteacher.py train --train-data data/processed_datasets/topical_chat_train.bin --block-size 512
+
+# Or combine with other datasets (default behavior)
+python llmteacher.py train --block-size 512
+```
+
+### Use custom text file for training#
+```bash
+# Prepare any .txt file (one example per line)
+python llmteacher.py prepare_random data/custom_stories.txt
+# Creates: data/custom_stories.bin + custom_stories.bin.meta.json
+
+# Train on custom data
+python llmteacher.py train --train-data data/custom_stories.bin --block-size 512
+```
+
+### Dataset chunking (avoid repetition)#
+```bash
+# Start training
+python llmteacher.py train --output data/models/run1.pt
+
+# If interrupted (Ctrl+C), auto-generates new chunk
+# Or manually prepare next chunk:
+python llmteacher.py prepare-next-chunk
+
+# Continue with fresh data
+python llmteacher.py continue data/models/run1_interrupted.pt
+```
+
+### Preview configuration and datasets#
+```bash
+# Show full configuration
+python llmteacher.py preview
+
+# List all datasets with sample counts
+python llmteacher.py datasets
+```
+
+### Switch to Gemma3 tokenizer and retrain#
+```bash
+# Edit config/model_config.json: "tokenizer": "gemma3"
+python llmteacher.py prepare
+python llmteacher.py prepare-rocstories
+python llmteacher.py combine-datasets
+python llmteacher.py train --output data/models/gemma3_run.pt
+```
+
+### Continue with different learning rate#
+Edit `config/training_config.json`, then:
+```bash
+python llmteacher.py continue data/models/first_run.pt --output data/models/second_run.pt
+```
+
+### Generate from latest checkpoint#
+```bash
+python llmteacher.py generate --latest --prompt "The cat sat on"
+```
+
+### Compare all tokenizers#
+```bash
+python -c "
+from data_processor.tokenizer_loader import compare_tokenizers
+result = compare_tokenizers('Hello, world! This is LLMTeacher.')
+for name, data in result.items():
+    print(f"{name}: {data['count']} tokens, vocab={data.get('vocab_size', 'N/A')}")
+"
+```
+
 ### Switch to Gemma3 tokenizer and retrain#
 ```bash
 # Edit config/model_config.json: "tokenizer": "gemma3"
@@ -224,15 +366,17 @@ llmteacher/
 ├── data_processor/             # Data processing
 │   ├── __init__.py
 │   ├── process.py              # Tokenization functions
-│   └── tokenizer_loader.py      # Multi-tokenizer support (6 tokenizers)
+│   ├── tokenizer_loader.py      # Multi-tokenizer support (6 tokenizers)
+│   └── conversation_datasets.py # Conversational dataset processing
 ├── training/                   # Training utilities
-│   ├── get_batch.py            # Batch generation
+│   ├── get_batch.py            # Batch generation (configurable via TRAIN_DATA_PATH)
 │   ├── loss.py                 # Loss estimation
 │   └── training_config.py      # Training config loader
 ├── data/                       # Data storage
 │   ├── models/                 # Saved checkpoints + metadata
 │   ├── processed_datasets/     # Processed binary data
-│   └── ROCStories/             # ROCStories text files
+│   ├── ROCStories/             # ROCStories text files
+│   └── Topical-Chat/           # Topical-Chat conversational dataset
 ├── wandb/                      # Weights & Biases logs
 └── results/                    # Training results + analysis
 ```

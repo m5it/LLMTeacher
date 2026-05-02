@@ -120,27 +120,75 @@ python llmteacher.py prepare-rocstories  # optional
 # 3. Combine datasets
 python llmteacher.py combine-datasets
 
-# 4. Train
+# 4. Preview configuration
+python llmteacher.py preview
+
+# 5. Train
 python llmteacher.py train --output data/models/first_run.pt
 
-# 5. Generate text
+# 6. Generate text
 python llmteacher.py generate --latest --prompt "Once upon a time"
+```
+
+## 📊 Commands Overview
+
+```bash
+# Configuration & Info
+python llmteacher.py preview              # Show full configuration, datasets, checkpoints
+python llmteacher.py datasets            # List all processed datasets with sample counts
+python llmteacher.py list-checkpoints   # List available model checkpoints
+python llmteacher.py history             # Show command history
+
+# Data Preparation
+python llmteacher.py prepare                           # Download & tokenize TinyStories
+python llmteacher.py prepare-rocstories             # Process ROCStories to binary
+python llmteacher.py prepare-codesearch               # Download CodeSearchNet
+python llmteacher.py combine-datasets                # Combine TinyStories + ROCStories
+python llmteacher.py prepare-conv --dataset topical_chat  # Process conversational datasets
+python llmteacher.py prepare_random data/custom.txt  # Tokenize any .txt file to .bin
+
+# Training
+python llmteacher.py train --block-size 512        # Train from scratch
+python llmteacher.py continue checkpoint.pt          # Continue from checkpoint
+python llmteacher.py train --train-data custom.bin   # Train on specific .bin file
+
+# Generation & Chat
+python llmteacher.py generate --latest --prompt "..."  # Generate text
+python llmteacher.py chat --latest                    # Interactive chat
 ```
 
 ## 📊 Training Details
 
-### Dataset
-- **TinyStories**: ~471M tokens (GPT-2 tokenizer)
+### Dataset Options
+- **TinyStories**: ~471M tokens (GPT-2 tokenizer), block_size=512
 - **ROCStories**: ~4M tokens added (optional)
-- **Total**: ~475M tokens combined
-- Processed into memory-mapped binary files for efficient loading
+- **CodeSearchNet**: ~380M tokens for code understanding, block_size=128
+- **Topical-Chat**: ~9.7k conversations for chat training
+- **Discord-Dialogues**: ~100k conversations from HuggingFace
+- **Custom datasets**: Use `prepare_random <file.txt>` for any text file
+
+### Dataset Commands
+```bash
+# Prepare conversational datasets
+python llmteacher.py prepare-conv --dataset topical_chat --max-samples 10000
+python llmteacher.py prepare-conv --dataset discord
+
+# Slice datasets (get samples from specific range)
+python llmteacher.py prepare-conv --dataset topical_chat --from-sample 10000 --to-sample 20000
+
+# Prepare custom text file
+python llmteacher.py prepare_random data/custom_stories.txt
+
+# List all datasets with sample counts
+python llmteacher.py datasets
+```
 
 ### Training Configuration
 - **Learning Rate**: 1e-4 with cosine annealing (configurable in `config/training_config.json`)
 - **Warmup Steps**: 1,000
-- **Max Iterations**: 150,000
+- **Max Iterations**: 100,000
 - **Batch Size**: 2 (effective: 8 with gradient accumulation)
-- **Block Size**: 128 tokens
+- **Block Size**: 512 (stories), 128 (code) - configurable via `--block-size`
 - **Gradient Accumulation**: 4 steps
 - **Mixed Precision**: bfloat16
 - **Optimizer**: AdamW with β₁=0.9, β₂=0.95, weight decay=0.1
@@ -152,6 +200,9 @@ python llmteacher.py generate --latest --prompt "Once upon a time"
 - Mixed precision training with automatic scaling
 - **Auto-generated checkpoint names** with timestamps
 - **Metadata JSON** saved with each checkpoint (tokenizer, vocab_size, val_loss)
+- **Dataset chunking**: `prepare-next-chunk` skips used stories for fresh training
+- **Custom data paths**: `--train-data` flag for training on specific .bin files
+- **Ctrl+C handling**: Auto-saves interrupt checkpoint + generates new chunk
 
 ## 📊 Performance
 

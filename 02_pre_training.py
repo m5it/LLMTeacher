@@ -91,7 +91,7 @@ with wandb.init(project="pretraining-gemma3_270b", config=training_config_select
         # Ensure X and y are on the correct device
         X, y = get_batch("train", block_size, batch_size, device, device_type)
         X, y = X.to(device), y.to(device)
-
+		print("DEBUG 02_pre_training.py device: {}".format(device))
         with ctx:
             logits, loss = model(X, y)
             loss = loss / gradient_accumulation_steps

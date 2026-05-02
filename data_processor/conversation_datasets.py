@@ -30,15 +30,27 @@ def download_dailydialog():
         print(f"Error loading DailyDialog: {e}")
         return None, None
 
-def download_topical_chat(data_dir="data/Topical-Chat/conversations"):
-    """Load Topical-Chat dataset from local files."""
+def download_topical_chat(data_dir="data/Topical-Chat/conversations", json_files=None):
+    """Load Topical-Chat dataset from local files.
+
+    Args:
+        data_dir: Base directory for JSON files
+        json_files: List of JSON files to load (relative to data_dir). If None, uses defaults.
+    """
     data_dir = Path(data_dir)
     if not data_dir.exists():
         print(f"Topical-Chat directory not found: {data_dir}")
         return None, None
 
     all_conversations = []
-    for json_file in ["train.json", "valid_freq.json", "test_freq.json"]:
+
+    # Use custom json_files if provided, otherwise defaults
+    if json_files:
+        files_to_load = json_files
+    else:
+        files_to_load = ["train.json", "valid_freq.json", "test_freq.json"]
+
+    for json_file in files_to_load:
         file_path = data_dir / json_file
         if file_path.exists():
             print(f"Loading {json_file}...")
@@ -86,7 +98,7 @@ def format_conversation_topical_chat(conversation):
 
 def process_conversational_data(tokenizer_name="gpt2", output_dir="data/processed_datasets",
                                  dataset_name="discord", max_samples=100000,
-                                 from_sample=None, to_sample=None):
+                                 from_sample=None, to_sample=None, json_files=None, json_dir=None):
     """Process conversational dataset into binary format.
 
     Args:
@@ -105,7 +117,9 @@ def process_conversational_data(tokenizer_name="gpt2", output_dir="data/processe
         dataset, name = download_dailydialog()
         format_fn = format_conversation_dailydialog
     elif dataset_name == "topical_chat":
-        dataset, name = download_topical_chat()
+        # Use custom json_dir if provided, otherwise default
+        dir_path = json_dir if json_dir else "data/Topical-Chat/conversations"
+        dataset, name = download_topical_chat(data_dir=dir_path, json_files=json_files)
         format_fn = format_conversation_topical_chat
     else:
         print(f"Unknown dataset: {dataset_name}")

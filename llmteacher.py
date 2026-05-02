@@ -1029,6 +1029,10 @@ def main():
     conv_parser.add_argument("--dataset", type=str, default="discord",
                           choices=["discord", "dailydialog", "topical_chat"],
                           help="Conversational dataset to process")
+    conv_parser.add_argument("--json-files", type=str, nargs="*",
+                          help="Specific JSON files to load (relative to json-dir). If not set, uses defaults.")
+    conv_parser.add_argument("--json-dir", type=str, default=None,
+                          help="Directory containing JSON files (default: data/Topical-Chat/conversations for topical_chat)")
     conv_parser.add_argument("--from-sample", type=int, default=None,
                           help="Start sample index (for slicing dataset)")
     conv_parser.add_argument("--to-sample", type=int, default=None,

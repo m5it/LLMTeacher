@@ -1,8 +1,4 @@
-# LLMTeacher - Gemma3 270M TinyStories
-
-LLMTeacher is a from-scratch PyTorch implementation of Google DeepMind's Gemma3 270M model. It features a streamlined transformer architecture designed to help users understand and experiment with the core components of large language models.
-
-**Objective:** This project aims to evaluate the coherence and language modeling capabilities of a small transformer-based model (Gemma3 270M) when trained from scratch on the TinyStories dataset. By leveraging TinyStories — a dataset of simple, coherent narratives — we can directly assess how well a compact language model learns to generate logical, contextually consistent, and fluent text.
+# LLMTeacher - Gemma3 270M - Instructions
 
 ## 🆕 New Features
 

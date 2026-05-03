@@ -4,6 +4,39 @@ LLMTeacher is a from-scratch PyTorch implementation of Google DeepMind's Gemma3 
 
 **Objective:** This project aims to evaluate the coherence and language modeling capabilities of a small transformer-based model (Gemma3 270M) when trained from scratch on the TinyStories dataset. By leveraging TinyStories — a dataset of simple, coherent narratives — we can directly assess how well a compact language model learns to generate logical, contextually consistent, and fluent text.
 
+## 🆕 New Features
+
+### Download & Convert HuggingFace Models
+```bash
+# Download pre-trained Gemma model from HuggingFace
+python llmteacher.py download-model google/gemma-3-270m-it
+
+# Convert HuggingFace model to LLMTeacher format
+python llmteacher.py convert-model data/models/google_gemma-3-270m-it.pt
+
+# Train on conversational data with converted model
+python llmteacher.py train --checkpoint data/models/google_gemma-3-270m-it_converted.pt
+```
+
+### Fresh Training Start
+```bash
+# Ignore previous training progress and start fresh
+python llmteacher.py train --checkpoint model.pt --fresh
+python llmteacher.py continue model.pt --fresh
+```
+
+### Instruction Model Support
+- **Hardcoded instruction format**: All generation uses Gemma3-style chat format (`<start_of_turn>user...\n<start_of_turn>model\n`)
+- **Auto tokenizer detection**: Automatically uses Gemma tokenizer (256k vocab) or GPT-2 (50k vocab) based on model
+- **Conversational datasets**: Train on blended_skill_talk, daily_dialog, and more
+
+### Prepare Custom Data with Model Type
+```bash
+# Prepare any text file as instruction or story format
+python llmteacher.py prepare_random data/custom.txt --model-type instruction
+python llmteacher.py prepare_random data/story.txt --model-type story
+```
+
 ## 🧠 Architecture
 
 ![architecture](./architecture/architecture.png)
@@ -131,28 +164,33 @@ python llmteacher.py generate --latest --prompt "Once upon a time"
 ```
 
 ## 📊 Commands Overview
-
+ 
 ```bash
 # Configuration & Info
 python llmteacher.py preview              # Show full configuration, datasets, checkpoints
 python llmteacher.py datasets            # List all processed datasets with sample counts
 python llmteacher.py list-checkpoints   # List available model checkpoints
 python llmteacher.py history             # Show command history
-
+ 
 # Data Preparation
 python llmteacher.py prepare                           # Download & tokenize TinyStories
 python llmteacher.py prepare-rocstories             # Process ROCStories to binary
 python llmteacher.py prepare-codesearch               # Download CodeSearchNet
 python llmteacher.py combine-datasets                # Combine TinyStories + ROCStories
-python llmteacher.py prepare-conv --dataset topical_chat  # Process conversational datasets
-python llmteacher.py prepare_random data/custom.txt  # Tokenize any .txt file to .bin
-
+python llmteacher.py prepare-conv --dataset blended_skill_talk  # Process conversational datasets
+python llmteacher.py prepare_random data/custom.txt --model-type instruction  # Tokenize as instruction/story
+ 
+# Download & Convert Models
+python llmteacher.py download-model google/gemma-3-270m-it  # Download from HuggingFace
+python llmteacher.py convert-model data/models/xxx.pt         # Convert to LLMTeacher format
+ 
 # Training
-python llmteacher.py train --block-size 512        # Train from scratch
+python llmteacher.py train --block-size 256         # Train from scratch (256 for conversations)
 python llmteacher.py continue checkpoint.pt          # Continue from checkpoint
+python llmteacher.py train --checkpoint model.pt --fresh  # Fresh start (ignore progress)
 python llmteacher.py train --train-data custom.bin   # Train on specific .bin file
-
-# Generation & Chat
+ 
+# Generation & Chat (Instruction format hardcoded)
 python llmteacher.py generate --latest --prompt "..."  # Generate text
 python llmteacher.py chat --latest                    # Interactive chat
 ```

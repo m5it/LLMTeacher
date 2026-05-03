@@ -334,6 +334,68 @@ def download_model(model_name, output_dir="data/models"):
         return None
 
 
+def convert_hf_to_llmteacher(hf_model_path, output_path=None):
+    """Convert HuggingFace Gemma model to LLMTeacher format."""
+    from pathlib import Path
+    import torch
+
+    hf_model_path = Path(hf_model_path)
+    if output_path is None:
+        output_path = hf_model_path.parent / f"{hf_model_path.stem}_converted.pt"
+
+    print(f"\n{'='*60}")
+    print(f"CONVERTING HUGGINGFACE MODEL TO LLMTEACHER FORMAT")
+    print(f"{'='*60}\n")
+
+    print(f"Loading HuggingFace model from {hf_model_path}...")
+    hf_state_dict = torch.load(hf_model_path, map_location='cpu')
+
+    # Map HuggingFace keys to our architecture
+    our_state_dict = {}
+
+    # Embedding
+    our_state_dict['tok_emb.weight'] = hf_state_dict['model.embed_tokens.weight']
+
+    # Layer mapping (18 layers)
+    for layer_idx in range(18):
+        # Attention
+        our_state_dict[f'blocks.{layer_idx}.att.W_query.weight'] = hf_state_dict[f'model.layers.{layer_idx}.self_attn.q_proj.weight']
+        our_state_dict[f'blocks.{layer_idx}.att.W_key.weight'] = hf_state_dict[f'model.layers.{layer_idx}.self_attn.k_proj.weight']
+        our_state_dict[f'blocks.{layer_idx}.att.W_value.weight'] = hf_state_dict[f'model.layers.{layer_idx}.self_attn.v_proj.weight']
+        our_state_dict[f'blocks.{layer_idx}.att.out_proj.weight'] = hf_state_dict[f'model.layers.{layer_idx}.self_attn.o_proj.weight']
+
+        # QK norm (scale in our model, weight in HF)
+        our_state_dict[f'blocks.{layer_idx}.att.q_norm.scale'] = hf_state_dict[f'model.layers.{layer_idx}.self_attn.q_norm.weight']
+        our_state_dict[f'blocks.{layer_idx}.att.k_norm.scale'] = hf_state_dict[f'model.layers.{layer_idx}.self_attn.k_norm.weight']
+
+        # MLP
+        our_state_dict[f'blocks.{layer_idx}.ff.fc1.weight'] = hf_state_dict[f'model.layers.{layer_idx}.mlp.gate_proj.weight']
+        our_state_dict[f'blocks.{layer_idx}.ff.fc2.weight'] = hf_state_dict[f'model.layers.{layer_idx}.mlp.up_proj.weight']
+        our_state_dict[f'blocks.{layer_idx}.ff.fc3.weight'] = hf_state_dict[f'model.layers.{layer_idx}.mlp.down_proj.weight']
+
+        # Layer norms (scale in our model, weight in HF)
+        our_state_dict[f'blocks.{layer_idx}.input_layernorm.scale'] = hf_state_dict[f'model.layers.{layer_idx}.input_layernorm.weight']
+        our_state_dict[f'blocks.{layer_idx}.post_attention_layernorm.scale'] = hf_state_dict[f'model.layers.{layer_idx}.post_attention_layernorm.weight']
+        our_state_dict[f'blocks.{layer_idx}.pre_feedforward_layernorm.scale'] = hf_state_dict[f'model.layers.{layer_idx}.pre_feedforward_layernorm.weight']
+        our_state_dict[f'blocks.{layer_idx}.post_feedforward_layernorm.scale'] = hf_state_dict[f'model.layers.{layer_idx}.post_feedforward_layernorm.weight']
+
+    # Final norm and output head
+    our_state_dict['final_norm.scale'] = hf_state_dict['model.norm.weight']
+    our_state_dict['out_head.weight'] = hf_state_dict['lm_head.weight']
+
+    print(f"Saving converted model to {output_path}...")
+    torch.save(our_state_dict, output_path)
+
+    print(f"\n{'='*60}")
+    print(f"CONVERSION COMPLETE!")
+    print(f"Saved to: {output_path}")
+    print(f"Vocab size: {our_state_dict['tok_emb.weight'].shape[0]}")
+    print(f"NOTE: This model uses 256k vocab - you'll need Gemma tokenizer")
+    print(f"{'='*60}\n")
+
+    return str(output_path)
+
+
 def prepare_random(txt_path, model_type="story"):
     """Tokenize a .txt file to .bin format for training.
 
@@ -565,11 +627,24 @@ def train(checkpoint_path=None, output_path=None, device_arg=None, block_size_ov
         output_path = f"data/models/model_lr{lr_str}_{timestamp}.pt"
         print(f"Auto-generated output path: {output_path}")
 
-    # Sync vocab_size with tokenizer
-    vocab_size = get_vocab_size()
-    if model_config.get("vocab_size") != vocab_size:
-        print(f"Updating model_config vocab_size: {model_config.get('vocab_size')} -> {vocab_size}")
-        model_config["vocab_size"] = vocab_size
+    # If loading from checkpoint, use checkpoint's vocab size FIRST
+    checkpoint_loaded = False
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Checking checkpoint vocab size...")
+        ckpt = torch.load(checkpoint_path, map_location='cpu')
+        if 'tok_emb.weight' in ckpt:
+            ckpt_vocab = ckpt['tok_emb.weight'].shape[0]
+            if ckpt_vocab != model_config['vocab_size']:
+                print(f"Adjusting vocab_size from {model_config['vocab_size']} to {ckpt_vocab} (from checkpoint)")
+                model_config['vocab_size'] = ckpt_vocab
+            checkpoint_loaded = True
+
+    # Sync vocab_size with tokenizer ONLY if no checkpoint loaded
+    if not checkpoint_loaded:
+        vocab_size = get_vocab_size()
+        if model_config.get("vocab_size") != vocab_size:
+            print(f"Updating model_config vocab_size: {model_config.get('vocab_size')} -> {vocab_size}")
+            model_config["vocab_size"] = vocab_size
 
     model_config["dtype"] = torch.bfloat16
     torch.manual_seed(123)
@@ -937,6 +1012,7 @@ def get_latest_checkpoint():
 
 def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100, temperature=0.8, top_k=50, model_type="instruction"):
     """Generate text from a prompt. Formats as instruction (chat) by default."""
+    import os
     global DEVICE, DEVICE_TYPE, CTX
     # Ensure DEVICE is set
     if DEVICE is None:
@@ -994,6 +1070,12 @@ def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100,
 
     # Load model to get parameter count
     model_config["dtype"] = torch.bfloat16
+
+    # Check if we need to update tokenizer config
+    if model_config['vocab_size'] == 262144:
+        print(f"256k vocab detected - this model uses Gemma tokenizer")
+        print(f"Note: config/model_config.json still shows gpt2 tokenizer")
+
     model = Gemma3Model(model_config)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1045,15 +1127,29 @@ def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100,
     model = model.to(DEVICE)
     model.eval()
 
-    tokenizer_name = get_tokenizer_name()
-    if tokenizer_name == "gpt2":
+    # Auto-detect tokenizer based on vocab size
+    if model_config['vocab_size'] == 262144:
+        print(f"Using Gemma tokenizer (256k vocab)")
+        from transformers import AutoTokenizer
+        import logging
+        import sys
+        # Suppress huggingface_hub logging and curl output
+        logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
+        logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+        logging.getLogger("requests").setLevel(logging.CRITICAL)
+        # Redirect stderr temporarily to suppress curl output
+        old_stderr = sys.stderr
+        sys.stderr = open(os.devnull, 'w')
+        try:
+            cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+            enc = AutoTokenizer.from_pretrained("google/gemma-3-270m", cache_dir=cache_dir)
+        finally:
+            sys.stderr.close()
+            sys.stderr = old_stderr
+    else:
+        print(f"Using GPT-2 tokenizer (50k vocab)")
         import tiktoken
         enc = tiktoken.get_encoding("gpt2")
-    elif tokenizer_name == "gemma3":
-        from transformers import AutoTokenizer
-        enc = AutoTokenizer.from_pretrained("google/gemma-3-270m")
-    else:
-        raise ValueError(f"Unsupported tokenizer: {tokenizer_name}")
 
     # Format prompt as instruction (Gemma3-style chat format)
     formatted_prompt = f"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
@@ -1148,6 +1244,11 @@ def main():
     download_parser.add_argument("model_name", type=str, help="Model name (e.g., google/gemma-3-270m-it)")
     download_parser.add_argument("--output-dir", type=str, default="data/models",
                           help="Output directory (default: data/models)")
+
+    # Convert model
+    convert_parser = subparsers.add_parser("convert-model", help="Convert HuggingFace model to LLMTeacher format")
+    convert_parser.add_argument("model_path", type=str, help="Path to HuggingFace model .pt file")
+    convert_parser.add_argument("--output", type=str, default=None, help="Output path (default: <model>_converted.pt")
 
     # Train
     train_parser = subparsers.add_parser("train", help="Train model from scratch")
@@ -1281,6 +1382,8 @@ def main():
         combine_with_conversational_data()
     elif args.command == "download-model":
         download_model(args.model_name, args.output_dir)
+    elif args.command == "convert-model":
+        convert_hf_to_llmteacher(args.model_path, args.output)
     elif args.command == "history":
         show_history(args.n)
 

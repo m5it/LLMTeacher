@@ -268,8 +268,79 @@ def combine_datasets():
 
     print("Dataset combination complete.")
 
-def prepare_random(txt_path):
-    """Tokenize a .txt file to .bin format for training."""
+def download_model(model_name, output_dir="data/models"):
+    """Download a pretrained model from HuggingFace."""
+    from pathlib import Path
+    import torch
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"DOWNLOADING MODEL: {model_name}")
+    print(f"{'='*60}\n")
+
+    try:
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+
+        print(f"Loading tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        print(f"✅ Tokenizer loaded: {type(tokenizer).__name__}")
+
+        print(f"Loading model (this may take a while)...")
+        model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
+        print(f"✅ Model loaded: {type(model).__name__}")
+
+        # Save model
+        output_path = output_dir / f"{model_name.replace('/', '_')}.pt"
+        print(f"\nSaving to {output_path}...")
+
+        # Convert to our format if it's Gemma
+        if "gemma" in model_name.lower():
+            print(f"Gemma model detected - saving state dict...")
+            torch.save(model.state_dict(), output_path)
+        else:
+            print(f"Non-Gemma model - saving full model...")
+            torch.save(model, output_path)
+
+        # Save metadata
+        meta = {
+            "model_name": model_name,
+            "tokenizer": tokenizer.name_or_path,
+            "vocab_size": len(tokenizer),
+            "model_type": "gemma" if "gemma" in model_name.lower() else "other"
+        }
+        meta_path = output_path.with_suffix('.json')
+        Path(meta_path).write_text(json.dumps(meta, indent=2))
+        print(f"✅ Saved metadata to {meta_path}")
+
+        print(f"\n{'='*60}")
+        print(f"DOWNLOAD COMPLETE!")
+        print(f"Saved to: {output_path}")
+        print(f"{'='*60}\n")
+
+        return str(output_path)
+
+    except Exception as e:
+        print(f"\n❌ Download failed: {e}")
+        if "GatedRepoError" in str(type(e).__name__) or "403" in str(e):
+            print(f"\n🔒 This model is gated. You need to request access:")
+            print(f"   1. Visit https://huggingface.co/{model_name}")
+            print(f"   2. Click 'Request access'")
+            print(f"   3. Wait for approval (usually instant for Gemma)")
+            print(f"   4. Run again: python llmteacher.py download-model {model_name}")
+        else:
+            print(f"Make sure you're logged in: huggingface-cli login")
+        return None
+
+
+def prepare_random(txt_path, model_type="story"):
+    """Tokenize a .txt file to .bin format for training.
+
+    Args:
+        txt_path: Path to .txt or .json file
+        model_type: "story" (plain text) or "instruction" (formats as User:/Assistant:)
+    """
     txt_path = Path(txt_path)
     if not txt_path.exists():
         print(f"File not found: {txt_path}")
@@ -280,9 +351,45 @@ def prepare_random(txt_path):
 
     print(f"Processing {txt_path.name}...")
 
-    # Read all lines (one example per line)
-    with open(txt_path, 'r') as f:
-        examples = [line.strip() for line in f if line.strip()]
+    # Detect JSON file
+    if txt_path.suffix == '.json':
+        with open(txt_path, 'r') as f:
+            data = json.load(f)
+        # Handle different JSON formats
+        if isinstance(data, dict):
+            # Topical-Chat style: dict with conversation IDs
+            examples = []
+            for conv_id, conv in data.items():
+                if "content" in conv:
+                    examples.extend([turn.get("message", "") for turn in conv["content"] if turn.get("message")])
+            print(f"Loaded {len(data)} conversations, {len(examples)} messages")
+        elif isinstance(data, list):
+            # List of conversations
+            examples = []
+            for item in data:
+                if isinstance(item, dict) and "text" in item:
+                    examples.append(item["text"])
+                elif isinstance(item, str):
+                    examples.append(item)
+            print(f"Loaded {len(examples)} examples from JSON")
+        else:
+            print(f"Unknown JSON format - treating as text")
+            examples = [str(data)]
+    else:
+        # Read all lines (one example per line)
+        with open(txt_path, 'r') as f:
+            examples = [line.strip() for line in f if line.strip()]
+
+    # Format based on model_type
+    if model_type == "instruction":
+        print(f"Formatting as instruction (User:/Assistant:)...")
+        formatted = []
+        for i, ex in enumerate(examples):
+            if i % 2 == 0:
+                formatted.append(f"User: {ex}")
+            else:
+                formatted.append(f"Assistant: {ex}")
+        examples = formatted
 
     print(f"Found {len(examples):,} examples")
 
@@ -385,7 +492,7 @@ def prepare_next_chunk():
     print("\nNext chunk ready! Training will use the new chunk automatically.")
     print(f"Run: python llmteacher.py continue <checkpoint> --device cuda")
 
-def train(checkpoint_path=None, output_path=None, device_arg=None, block_size_override=None, train_data_path=None):
+def train(checkpoint_path=None, output_path=None, device_arg=None, block_size_override=None, train_data_path=None, fresh=False):
     """Train model from scratch or continue from checkpoint."""
     global DEVICE, DEVICE_TYPE, CTX, block_size
 
@@ -401,6 +508,22 @@ def train(checkpoint_path=None, output_path=None, device_arg=None, block_size_ov
         print(f"Block size overridden to: {block_size}")
     else:
         print(f"Using block_size from config: {block_size}")
+
+    # Handle --fresh flag (ignore training_progress.json)
+    progress_file = Path("data/training_progress.json")
+    if fresh and progress_file.exists():
+        print(f"Fresh start requested - removing {progress_file}")
+        progress_file.unlink()
+        start_epoch = 0
+    elif checkpoint_path and progress_file.exists():
+        try:
+            progress = json.loads(progress_file.read_text())
+            start_epoch = progress.get("epoch", 0)
+            print(f"Resuming from epoch {start_epoch}")
+        except:
+            start_epoch = 0
+    else:
+        start_epoch = 0
     
     # W&B login if available
     if WANDB_AVAILABLE:
@@ -812,8 +935,8 @@ def get_latest_checkpoint():
     return max(checkpoints, key=lambda p: p.stat().st_mtime)
 
 
-def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100, temperature=0.8, top_k=50):
-    """Generate text from a prompt."""
+def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100, temperature=0.8, top_k=50, model_type="instruction"):
+    """Generate text from a prompt. Formats as instruction (chat) by default."""
     global DEVICE, DEVICE_TYPE, CTX
     # Ensure DEVICE is set
     if DEVICE is None:
@@ -848,7 +971,23 @@ def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100,
 
     # Load checkpoint to check vocab size - use DEVICE not hardcoded cpu
     ckpt = torch.load(checkpoint_path, map_location=DEVICE)
-    ckpt_vocab_size = ckpt['tok_emb.weight'].shape[0]
+
+    # Check if it's a HuggingFace model (different key names)
+    if 'model.embed_tokens.weight' in ckpt:
+        print(f"\n❌ ERROR: HuggingFace Gemma model detected!")
+        print(f"This model uses different architecture and tokenizer than LLMTeacher.")
+        print(f"LLMTeacher uses GPT-2 tokenizer (50k vocab), while HuggingFace Gemma uses 256k vocab.")
+        print(f"\nOptions:")
+        print(f"1. Train a model from scratch: python llmteacher.py train")
+        print(f"2. Use the downloaded model with transformers library directly")
+        print(f"3. Convert the model (not yet implemented)")
+        return
+    elif 'tok_emb.weight' in ckpt:
+        ckpt_vocab_size = ckpt['tok_emb.weight'].shape[0]
+    else:
+        print(f"Available keys: {list(ckpt.keys())[:10]}")
+        raise KeyError(f"Cannot find embedding weights in checkpoint")
+
     if ckpt_vocab_size != model_config['vocab_size']:
         print(f"Adjusting vocab_size from {model_config['vocab_size']} to {ckpt_vocab_size} (from checkpoint)")
         model_config['vocab_size'] = ckpt_vocab_size
@@ -916,7 +1055,11 @@ def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100,
     else:
         raise ValueError(f"Unsupported tokenizer: {tokenizer_name}")
 
-    tokens = enc.encode(prompt)
+    # Format prompt as instruction (Gemma3-style chat format)
+    formatted_prompt = f"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+    print(f"Using instruction format: {formatted_prompt[:100]}...")
+
+    tokens = enc.encode(formatted_prompt)
     tokens = torch.tensor(tokens, dtype=torch.long, device=DEVICE).unsqueeze(0)
 
     with torch.no_grad():
@@ -1000,15 +1143,23 @@ def main():
     codesearch_parser = subparsers.add_parser("prepare-codesearch", help="Download and process CodeSearchNet dataset")
     codesearch_parser.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer to use")
     
+    # Download model
+    download_parser = subparsers.add_parser("download-model", help="Download pretrained model from HuggingFace")
+    download_parser.add_argument("model_name", type=str, help="Model name (e.g., google/gemma-3-270m-it)")
+    download_parser.add_argument("--output-dir", type=str, default="data/models",
+                          help="Output directory (default: data/models)")
+
     # Train
     train_parser = subparsers.add_parser("train", help="Train model from scratch")
     train_parser.add_argument("--checkpoint", type=str, help="Continue training from checkpoint")
     train_parser.add_argument("--output", type=str, default=None, help="Output checkpoint path (auto-generated if not set)")
     train_parser.add_argument("--device", type=str, default=None, help="Device to use (cuda, cpu, or cuda:0). Default: from config")
     train_parser.add_argument("--block-size", type=int, default=None,
-                          help="Override block size from config (e.g. 128 for code, 512 for stories)")
+                          help="Override block size from config (e.g. 512 for stories, 128 for code)")
     train_parser.add_argument("--train-data", type=str, default=None,
                           help="Path to specific .bin file for training (overrides automatic dataset selection)")
+    train_parser.add_argument("--fresh", action="store_true",
+                          help="Start fresh (ignore training_progress.json, start from epoch 0)")
 
     # Continue (alias for train with checkpoint)
     continue_parser = subparsers.add_parser("continue", help="Continue training from checkpoint")
@@ -1019,10 +1170,14 @@ def main():
                           help="Override block size from config")
     continue_parser.add_argument("--train-data", type=str, default=None,
                           help="Path to specific .bin file for training")
+    continue_parser.add_argument("--fresh", action="store_true",
+                          help="Start fresh (ignore training_progress.json, start from epoch 0)")
 
     # Prepare random text file to .bin
-    prepare_random_parser = subparsers.add_parser("prepare_random", help="Tokenize .txt file to .bin")
-    prepare_random_parser.add_argument("txt_path", type=str, help="Path to .txt file (one example per line)")
+    prepare_random_parser = subparsers.add_parser("prepare_random", help="Tokenize .txt/.json file to .bin")
+    prepare_random_parser.add_argument("txt_path", type=str, help="Path to .txt (one example per line) or .json file")
+    prepare_random_parser.add_argument("--model-type", type=str, default="story", choices=["story", "instruction"],
+                          help="Format: story (plain text) or instruction (User:/Assistant:)")
 
     # Prepare conversational dataset (Discord, DailyDialog, Topical-Chat)
     conv_parser = subparsers.add_parser("prepare-conv", help="Process conversational dataset for chat training")
@@ -1045,6 +1200,8 @@ def main():
     gen_parser.add_argument("--prompt", type=str, default="Once upon a time", help="Text prompt")
     gen_parser.add_argument("--checkpoint", type=str, help="Model checkpoint to use")
     gen_parser.add_argument("--latest", action="store_true", help="Use the most recent checkpoint")
+    gen_parser.add_argument("--model-type", type=str, default="instruction",
+                          help="Model type: instruction (default, hardcoded format)")
     gen_parser.add_argument("--max-tokens", type=int, default=100, help="Max new tokens to generate")
     gen_parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
     gen_parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling parameter")
@@ -1056,6 +1213,8 @@ def main():
     chat_parser = subparsers.add_parser("chat", help="Start interactive chat with LLMTeacher")
     chat_parser.add_argument("--checkpoint", type=str, help="Model checkpoint to use")
     chat_parser.add_argument("--latest", action="store_true", help="Use the most recent checkpoint")
+    chat_parser.add_argument("--model-type", type=str, default="instruction",
+                          help="Model type: instruction (default, hardcoded format)")
     chat_parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
     chat_parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling parameter")
     chat_parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens per response")
@@ -1095,21 +1254,21 @@ def main():
     elif args.command == "prepare-next-chunk":
         prepare_next_chunk()
     elif args.command == "prepare_random":
-        prepare_random(args.txt_path)
+        prepare_random(args.txt_path, args.model_type)
     elif args.command == "datasets":
         list_datasets()
     elif args.command == "preview":
         preview()
     elif args.command == "train":
-        train(args.checkpoint, args.output, args.device, args.block_size, args.train_data)
+        train(args.checkpoint, args.output, args.device, args.block_size, args.train_data, args.fresh)
     elif args.command == "continue":
-        train(args.checkpoint, args.output, args.device, args.block_size, args.train_data)
+        train(args.checkpoint, args.output, args.device, args.block_size, args.train_data, args.fresh)
     elif args.command == "generate":
-        generate(args.prompt, args.checkpoint, args.latest, args.max_tokens, args.temperature, args.top_k)
+        generate(args.prompt, args.checkpoint, args.latest, args.max_tokens, args.temperature, args.top_k, args.model_type)
     elif args.command == "list-checkpoints":
         list_checkpoints()
     elif args.command == "chat":
-        chat(args.checkpoint, args.latest, args.temperature, args.top_k, args.max_tokens)
+        chat(args.checkpoint, args.latest, args.temperature, args.top_k, args.max_tokens, args.model_type)
     elif args.command == "prepare-conv":
         from data_processor.conversation_datasets import process_conversational_data, combine_with_conversational_data
         process_conversational_data(
@@ -1120,12 +1279,18 @@ def main():
             to_sample=args.to_sample
         )
         combine_with_conversational_data()
+    elif args.command == "download-model":
+        download_model(args.model_name, args.output_dir)
     elif args.command == "history":
         show_history(args.n)
 
 
-def chat(checkpoint_path=None, use_latest=False, temperature=0.8, top_k=50, max_tokens=100):
-    """Start interactive chat with LLMTeacher."""
+def chat(checkpoint_path=None, use_latest=False, temperature=0.8, top_k=50, max_tokens=100, model_type="instruction"):
+    """Start interactive chat with LLMTeacher.
+
+    Args:
+        model_type: "instruction" (formats as chat) - default
+    """
     global DEVICE, DEVICE_TYPE, CTX
     # Ensure DEVICE is set
     if DEVICE is None:
@@ -1246,11 +1411,12 @@ def chat(checkpoint_path=None, use_latest=False, temperature=0.8, top_k=50, max_
         if not user_input:
             continue
 
-        # Tokenize and add to history
+        # Tokenize and add to history (instruction format)
+        formatted_input = f"<start_of_turn>user\n{user_input}<end_of_turn>\n<start_of_turn>model\n"
         if tokenizer_name == "gpt2":
-            new_tokens = enc.encode_ordinary(user_input)
+            new_tokens = enc.encode_ordinary(formatted_input)
         else:
-            new_tokens = enc.encode(user_input, add_special_tokens=False)
+            new_tokens = enc.encode(formatted_input, add_special_tokens=False)
 
         history_tokens.extend(new_tokens)
 

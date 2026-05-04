@@ -9,21 +9,26 @@ Usage:
     python run.py continue --checkpoint data/models/best_model_params.pt  # Continue training
     python run.py generate --prompt "Once upon a time"  # Generate text (uses best_model_params.pt)
     python run.py generate --latest    # Generate text using most recent checkpoint
-    python run.py generate --checkpoint data/models/model.pt  # Use specific checkpoint
     python run.py list-checkpoints     # List available model checkpoints
     python run.py history              # Show command history
 """
 
-import os
 import sys
+import os
 import json
+import time
+import math
 import argparse
-import torch
-import numpy as np
-from datasets import load_dataset
-from tqdm.auto import tqdm
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+from tqdm import tqdm
+
+# Disable huggingface_hub completely to prevent ANY internet requests
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+os.environ['HF_HUB_OFFLINE'] = '1'
+
+# Import torch BEFORE using it
+import torch
 
 # GLOBAL DEVICE VARIABLE - set once and used everywhere
 # ALWAYS default to CUDA - fail immediately if CUDA not available
@@ -1132,20 +1137,23 @@ def generate(prompt, checkpoint_path=None, use_latest=False, max_new_tokens=100,
         print(f"Using Gemma tokenizer (256k vocab)")
         from transformers import AutoTokenizer
         import logging
-        import sys
-        # Suppress huggingface_hub logging and curl output
+        # Suppress all huggingface_hub logging
         logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
         logging.getLogger("urllib3").setLevel(logging.CRITICAL)
         logging.getLogger("requests").setLevel(logging.CRITICAL)
-        # Redirect stderr temporarily to suppress curl output
-        old_stderr = sys.stderr
-        sys.stderr = open(os.devnull, 'w')
+
+        # Use local_files_only=True to prevent ANY internet access
+        cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
         try:
-            cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
-            enc = AutoTokenizer.from_pretrained("google/gemma-3-270m", cache_dir=cache_dir)
-        finally:
-            sys.stderr.close()
-            sys.stderr = old_stderr
+            enc = AutoTokenizer.from_pretrained("google/gemma-3-270m",
+                                                cache_dir=cache_dir,
+                                                local_files_only=True)
+        except Exception as e:
+            print(f"Warning: Could not load tokenizer locally: {e}")
+            print(f"Trying with internet access...")
+            enc = AutoTokenizer.from_pretrained("google/gemma-3-270m",
+                                                cache_dir=cache_dir,
+                                                local_files_only=False)
     else:
         print(f"Using GPT-2 tokenizer (50k vocab)")
         import tiktoken

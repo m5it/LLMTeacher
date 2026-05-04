@@ -30,10 +30,21 @@ def get_tokenizer():
     elif name == "gemma3":
         # Use LLaMA tokenizer (Gemma3 uses LLaMA-based tokenizer)
         from transformers import LlamaTokenizerFast
+        import os
+        import logging
+        # Suppress all huggingface_hub logging
+        logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
+        logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+        logging.getLogger("requests").setLevel(logging.CRITICAL)
+
+        cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+        # ALWAYS use local_files_only=True to prevent ANY internet access
         tokenizer = LlamaTokenizerFast.from_pretrained(
             "google/gemma-2b",  # Gemma3 uses same vocab as Gemma 2
             trust_remote_code=True,
-            use_fast=True
+            use_fast=True,
+            cache_dir=cache_dir,
+            local_files_only=True  # NEVER access internet
         )
         return tokenizer, "gemma3", tokenizer.vocab_size
 
